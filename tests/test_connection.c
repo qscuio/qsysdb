@@ -449,11 +449,11 @@ TEST(invalid_path)
 
     /* Path without leading slash */
     int ret = qsysdb_set(db, "no/leading/slash", "1");
-    assert(ret == QSYSDB_ERR_INVALID);
+    assert(ret == QSYSDB_ERR_BADPATH);
 
-    /* Empty path */
+    /* Empty path is invalid */
     ret = qsysdb_set(db, "", "1");
-    assert(ret == QSYSDB_ERR_INVALID);
+    assert(ret == QSYSDB_ERR_BADPATH);
 
     qsysdb_disconnect(db);
     teardown_server();
@@ -468,10 +468,10 @@ TEST(invalid_json)
 
     /* Invalid JSON */
     int ret = qsysdb_set(db, "/bad", "not json");
-    assert(ret == QSYSDB_ERR_INVALID);
+    assert(ret == QSYSDB_ERR_BADJSON);
 
     ret = qsysdb_set(db, "/bad", "{broken");
-    assert(ret == QSYSDB_ERR_INVALID);
+    assert(ret == QSYSDB_ERR_BADJSON);
 
     qsysdb_disconnect(db);
     teardown_server();

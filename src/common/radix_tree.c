@@ -422,9 +422,6 @@ int radix_tree_iterate(struct radix_tree *tree, void *base,
     fprintf(stderr, "radix_tree_iterate: prefix='%.*s' prefix_len=%zu matched=%zu node=%p\n",
             (int)prefix_len, prefix, prefix_len, matched, (void*)node);
 #endif
-    /* TEMP DEBUG */
-    fprintf(stderr, "[DEBUG] radix_tree_iterate: prefix='%.*s' len=%zu matched=%zu node=%p\n",
-            (int)prefix_len, prefix, prefix_len, matched, (void*)node);
 
     if (node == NULL) {
         return 0;  /* No matches */
@@ -443,15 +440,10 @@ int radix_tree_iterate(struct radix_tree *tree, void *base,
          */
         if (matched > 0) {
             unsigned char edge_char = (unsigned char)prefix[matched - 1];
-            fprintf(stderr, "[DEBUG] partial match: matched=%zu, edge_char='%c' child=%u\n",
-                    matched, edge_char, node->children[edge_char]);
             if (node->children[edge_char] != 0) {
                 struct radix_node *child = node_ptr(base, node->children[edge_char]);
                 /* remaining = how much of prefix is left after the edge character */
                 size_t remaining = prefix_len - matched;
-                fprintf(stderr, "[DEBUG] child prefix_len=%u remaining=%zu child_prefix='%.*s' search_remaining='%.*s'\n",
-                        child->prefix_len, remaining, child->prefix_len, child->prefix,
-                        (int)remaining, prefix + matched);
                 /* Check if the child's prefix starts with the remaining search prefix */
                 if (child->prefix_len >= remaining &&
                     memcmp(child->prefix, prefix + matched, remaining) == 0) {
