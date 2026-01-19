@@ -1,0 +1,14 @@
+# QSysDB Kernel Module Kbuild file
+
+obj-m := kqsysdb.o
+
+# kqsysdb module consists of these objects
+# Note: netlink_kern.c is included directly in kqsysdb.c
+kqsysdb-y := kqsysdb.o
+
+# Extra compiler flags
+ccflags-y := -Wall -Werror
+ccflags-y += -I$(src)/../include
+
+# For debug builds
+# ccflags-y += -DDEBUG -g
