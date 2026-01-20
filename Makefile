@@ -116,7 +116,8 @@ TEST_CFLAGS := $(CFLAGS) -I$(CURDIR)/tests -Wno-unused-function
 # New comprehensive unit tests using the test framework
 .PHONY: tests-unit
 tests-unit: dirs $(COMMON_OBJS) $(DAEMON_OBJS_NO_MAIN) \
-	$(BINDIR)/test_json_unit $(BINDIR)/test_radix_unit $(BINDIR)/test_database_unit
+	$(BINDIR)/test_json_unit $(BINDIR)/test_radix_unit $(BINDIR)/test_database_unit \
+	$(BINDIR)/test_multiclient $(BINDIR)/test_network_tables
 
 $(BINDIR)/test_json_unit: $(TESTDIR)/unit/test_json_unit.c $(SRCDIR)/common/json.c
 	$(CC) $(TEST_CFLAGS) $^ -o $@ -lm
@@ -125,6 +126,12 @@ $(BINDIR)/test_radix_unit: $(TESTDIR)/unit/test_radix_unit.c $(SRCDIR)/common/ra
 	$(CC) $(TEST_CFLAGS) $^ -o $@ -lm
 
 $(BINDIR)/test_database_unit: $(TESTDIR)/unit/test_database_unit.c $(COMMON_OBJS) $(DAEMON_OBJS_NO_MAIN)
+	$(CC) $(TEST_CFLAGS) $^ -o $@ $(LDFLAGS) -lm
+
+$(BINDIR)/test_multiclient: $(TESTDIR)/unit/test_multiclient.c $(COMMON_OBJS) $(DAEMON_OBJS_NO_MAIN)
+	$(CC) $(TEST_CFLAGS) $^ -o $@ $(LDFLAGS) -lm
+
+$(BINDIR)/test_network_tables: $(TESTDIR)/unit/test_network_tables.c $(COMMON_OBJS) $(DAEMON_OBJS_NO_MAIN)
 	$(CC) $(TEST_CFLAGS) $^ -o $@ $(LDFLAGS) -lm
 
 # Benchmark tests
@@ -143,6 +150,8 @@ test-unit: tests-unit
 	@$(BINDIR)/test_json_unit
 	@$(BINDIR)/test_radix_unit
 	@$(BINDIR)/test_database_unit
+	@$(BINDIR)/test_multiclient
+	@$(BINDIR)/test_network_tables
 
 # Run benchmarks
 .PHONY: benchmark
@@ -200,6 +209,8 @@ test-all: tests tests-integration tests-unit
 	@$(BINDIR)/test_json_unit
 	@$(BINDIR)/test_radix_unit
 	@$(BINDIR)/test_database_unit
+	@$(BINDIR)/test_multiclient
+	@$(BINDIR)/test_network_tables
 	@echo ""
 	@echo "All tests passed!"
 
