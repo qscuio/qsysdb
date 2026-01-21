@@ -249,6 +249,73 @@ void qsysdb_async_disconnect(qsysdb_async_t *client);
 bool qsysdb_async_is_connected(qsysdb_async_t *client);
 
 /* ============================================
+ * Cluster Support
+ * ============================================ */
+
+/**
+ * Enable cluster mode
+ *
+ * In cluster mode, the client maintains connections to multiple servers
+ * and automatically routes operations to the appropriate server.
+ *
+ * @param client   Client handle
+ * @param enabled  Enable/disable cluster mode
+ */
+void qsysdb_async_set_cluster_mode(qsysdb_async_t *client, bool enabled);
+
+/**
+ * Add a server to the cluster
+ *
+ * Add multiple servers for automatic failover and load balancing.
+ *
+ * @param client   Client handle
+ * @param host     Server hostname or IP
+ * @param port     Server port (0 for default)
+ * @return         Server index on success, negative on error
+ */
+int qsysdb_async_add_server(qsysdb_async_t *client,
+                            const char *host, uint16_t port);
+
+/**
+ * Remove a server from the cluster
+ *
+ * @param client        Client handle
+ * @param server_index  Index returned by qsysdb_async_add_server
+ * @return              QSYSDB_OK on success
+ */
+int qsysdb_async_remove_server(qsysdb_async_t *client, int server_index);
+
+/**
+ * Connect to cluster
+ *
+ * Establishes connections to all configured servers.
+ *
+ * @param client  Client handle
+ * @param flags   Connection flags
+ * @return        QSYSDB_OK if at least one connection succeeded
+ */
+int qsysdb_async_connect_cluster(qsysdb_async_t *client, int flags);
+
+/**
+ * Get current leader server info
+ *
+ * @param client  Client handle
+ * @param host    Output buffer for leader hostname (may be NULL)
+ * @param port    Output pointer for leader port (may be NULL)
+ * @return        QSYSDB_OK if leader known, QSYSDB_ERR_NOTFOUND if no leader
+ */
+int qsysdb_async_get_leader(qsysdb_async_t *client,
+                            char *host, size_t host_len, uint16_t *port);
+
+/**
+ * Get number of connected servers
+ *
+ * @param client  Client handle
+ * @return        Number of servers currently connected
+ */
+int qsysdb_async_server_count(qsysdb_async_t *client);
+
+/* ============================================
  * Event Loop Integration
  * ============================================ */
 

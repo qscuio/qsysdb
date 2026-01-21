@@ -22,6 +22,8 @@
 
 #include <qsysdb/types.h>
 #include <qsysdb/protocol.h>
+#include <qsysdb/cluster.h>
+#include <qsysdb/replication.h>
 #include "server.h"
 #include "database.h"
 #include "subscription.h"
@@ -582,6 +584,10 @@ void server_config_init(struct server_config *config)
     /* Enable worker pool by default for better multi-client performance */
     config->worker_pool_enabled = true;
     config->worker_threads = 0;  /* Auto-detect based on CPU count */
+
+    /* Cluster disabled by default */
+    config->cluster_enabled = false;
+    qsysdb_cluster_config_init(&config->cluster);
 }
 
 static int setup_unix_socket(struct server *srv)
@@ -952,4 +958,112 @@ void server_stats(struct server *srv, int *client_count,
     if (client_count) *client_count = srv->client_count;
     if (total_connections) *total_connections = srv->total_connections;
     if (total_requests) *total_requests = srv->total_requests;
+}
+
+/*
+ * Callback for replication - apply replicated entry to database
+ */
+static void cluster_apply_entry(qsysdb_repl_entry_t *entry, void *userdata)
+{
+    struct server *srv = userdata;
+    uint64_t version = 0;
+
+    switch (entry->op_type) {
+    case QSYSDB_REPL_OP_SET:
+        db_set(srv->db, entry->path, entry->path_len,
+               entry->value, entry->value_len, entry->flags, &version);
+        break;
+
+    case QSYSDB_REPL_OP_DELETE:
+        db_delete(srv->db, entry->path, entry->path_len);
+        break;
+
+    case QSYSDB_REPL_OP_DELETE_TREE:
+        db_delete_tree(srv->db, entry->path, entry->path_len, NULL);
+        break;
+
+    default:
+        break;
+    }
+}
+
+/*
+ * Enable cluster mode
+ */
+int server_enable_cluster(struct server *srv, qsysdb_cluster_config_t *config)
+{
+    if (!srv || !config)
+        return QSYSDB_ERR_INVALID;
+
+    /* Create cluster instance */
+    srv->cluster = qsysdb_cluster_create(config);
+    if (!srv->cluster)
+        return QSYSDB_ERR_NOMEM;
+
+    /* Set up back-references */
+    srv->cluster->db = srv->db;
+    srv->cluster->server = srv;
+
+    /* Register replication callback */
+    qsysdb_replication_on_apply(srv->cluster, cluster_apply_entry, srv);
+
+    /* Start cluster */
+    int ret = qsysdb_cluster_start(srv->cluster);
+    if (ret != QSYSDB_OK) {
+        qsysdb_cluster_destroy(srv->cluster);
+        srv->cluster = NULL;
+        return ret;
+    }
+
+    return QSYSDB_OK;
+}
+
+/*
+ * Check if this server is the cluster leader
+ */
+bool server_is_leader(struct server *srv)
+{
+    if (!srv || !srv->cluster)
+        return true;  /* Not in cluster mode, act as leader */
+
+    return qsysdb_cluster_is_leader(srv->cluster);
+}
+
+/*
+ * Forward a write request to the leader (for follower nodes)
+ */
+int server_forward_to_leader(struct server *srv, struct client_conn *client,
+                             struct qsysdb_msg_header *hdr, void *payload)
+{
+    if (!srv || !srv->cluster || !client || !hdr)
+        return QSYSDB_ERR_INVALID;
+
+    /* If we are the leader, no forwarding needed */
+    if (server_is_leader(srv))
+        return QSYSDB_ERR_INVALID;
+
+    /* Forward the write to the leader */
+    void *response = NULL;
+    size_t response_len = 0;
+
+    size_t payload_len = hdr->msg_len - sizeof(*hdr);
+    int ret = qsysdb_cluster_forward_write(srv->cluster, hdr->msg_type,
+                                           payload, payload_len,
+                                           &response, &response_len);
+
+    if (ret != QSYSDB_OK) {
+        /* Return error to client - cluster is busy or no leader */
+        struct qsysdb_msg_header err_hdr;
+        qsysdb_msg_init(&err_hdr, hdr->msg_type + 99,  /* Convert to response type */
+                        sizeof(err_hdr), hdr->request_id);
+        err_hdr.error_code = ret;
+        client_send(client, &err_hdr, sizeof(err_hdr));
+        return ret;
+    }
+
+    /* Response will come asynchronously via cluster message */
+    /* For now, return success - a full implementation would wait for response */
+    free(response);
+
+    return QSYSDB_OK;
 }

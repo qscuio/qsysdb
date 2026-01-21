@@ -17,6 +17,7 @@
 #include <netinet/in.h>
 #include <netinet/tcp.h>
 #include <arpa/inet.h>
+#include <netdb.h>
 #include <poll.h>
 #include <pthread.h>
 
@@ -33,6 +34,7 @@
 #define RECV_BUF_SIZE       (2 * 1024 * 1024)
 #define SEND_BUF_SIZE       (1 * 1024 * 1024)
 #define MAX_BATCH_OPS       256
+#define MAX_CLUSTER_SERVERS 16
 
 /* Pending operation */
 struct qsysdb_op {
@@ -79,6 +81,16 @@ struct qsysdb_batch {
     struct batch_entry *entries;
     int count;
     int capacity;
+};
+
+/* Cluster server entry */
+struct cluster_server {
+    char host[256];
+    uint16_t port;
+    int fd;
+    bool connected;
+    bool is_leader;
+    uint64_t latency_us;        /* RTT in microseconds */
 };
 
 /* Async client */
@@ -132,6 +144,13 @@ struct qsysdb_async {
 
     /* Statistics */
     qsysdb_client_stats_t stats;
+
+    /* Cluster support */
+    bool cluster_mode;
+    struct cluster_server servers[MAX_CLUSTER_SERVERS];
+    int server_count;
+    int current_server;         /* Index of primary server */
+    int leader_index;           /* Index of known leader (-1 if unknown) */
 
     /* Thread safety */
     pthread_mutex_t lock;
@@ -1294,4 +1313,217 @@ void qsysdb_async_get_stats(qsysdb_async_t *client, qsysdb_client_stats_t *stats
     *stats = client->stats;
     stats->pending_ops = client->pending_count;
     stats->active_watches = client->watch_count;
+}
+
+/* ============================================
+ * Cluster Support
+ * ============================================ */
+
+void qsysdb_async_set_cluster_mode(qsysdb_async_t *client, bool enabled)
+{
+    if (!client) return;
+    pthread_mutex_lock(&client->lock);
+    client->cluster_mode = enabled;
+    if (!enabled) {
+        /* Reset cluster state when disabling */
+        client->leader_index = -1;
+    }
+    pthread_mutex_unlock(&client->lock);
+}
+
+int qsysdb_async_add_server(qsysdb_async_t *client, const char *host, uint16_t port)
+{
+    if (!client || !host)
+        return QSYSDB_ERR_INVALID;
+
+    pthread_mutex_lock(&client->lock);
+
+    if (client->server_count >= MAX_CLUSTER_SERVERS) {
+        pthread_mutex_unlock(&client->lock);
+        return QSYSDB_ERR_FULL;
+    }
+
+    int idx = client->server_count;
+    struct cluster_server *srv = &client->servers[idx];
+
+    strncpy(srv->host, host, sizeof(srv->host) - 1);
+    srv->host[sizeof(srv->host) - 1] = '\0';
+    srv->port = port ? port : QSYSDB_TCP_PORT_DEFAULT;
+    srv->fd = -1;
+    srv->connected = false;
+    srv->is_leader = false;
+    srv->latency_us = UINT64_MAX;
+
+    client->server_count++;
+
+    pthread_mutex_unlock(&client->lock);
+
+    return idx;
+}
+
+int qsysdb_async_remove_server(qsysdb_async_t *client, int server_index)
+{
+    if (!client || server_index < 0 || server_index >= client->server_count)
+        return QSYSDB_ERR_INVALID;
+
+    pthread_mutex_lock(&client->lock);
+
+    struct cluster_server *srv = &client->servers[server_index];
+
+    /* Close connection if open */
+    if (srv->fd >= 0) {
+        close(srv->fd);
+        srv->fd = -1;
+    }
+
+    /* Shift remaining servers */
+    for (int i = server_index; i < client->server_count - 1; i++) {
+        client->servers[i] = client->servers[i + 1];
+    }
+    client->server_count--;
+
+    /* Adjust indices */
+    if (client->current_server == server_index) {
+        client->current_server = 0;
+    } else if (client->current_server > server_index) {
+        client->current_server--;
+    }
+
+    if (client->leader_index == server_index) {
+        client->leader_index = -1;
+    } else if (client->leader_index > server_index) {
+        client->leader_index--;
+    }
+
+    pthread_mutex_unlock(&client->lock);
+
+    return QSYSDB_OK;
+}
+
+static int connect_to_server(qsysdb_async_t *client, struct cluster_server *srv)
+{
+    (void)client;  /* Reserved for future use */
+
+    /* Create socket */
+    int fd = socket(AF_INET, SOCK_STREAM, 0);
+    if (fd < 0)
+        return QSYSDB_ERR_IO;
+
+    /* Set non-blocking */
+    int flags = fcntl(fd, F_GETFL, 0);
+    fcntl(fd, F_SETFL, flags | O_NONBLOCK);
+
+    /* Set TCP options */
+    int optval = 1;
+    setsockopt(fd, IPPROTO_TCP, TCP_NODELAY, &optval, sizeof(optval));
+    setsockopt(fd, SOL_SOCKET, SO_KEEPALIVE, &optval, sizeof(optval));
+
+    /* Connect */
+    struct sockaddr_in addr;
+    memset(&addr, 0, sizeof(addr));
+    addr.sin_family = AF_INET;
+    addr.sin_port = htons(srv->port);
+
+    if (inet_pton(AF_INET, srv->host, &addr.sin_addr) <= 0) {
+        /* Try DNS resolution */
+        struct hostent *he = gethostbyname(srv->host);
+        if (!he) {
+            close(fd);
+            return QSYSDB_ERR_CONNECT;
+        }
+        memcpy(&addr.sin_addr, he->h_addr_list[0], he->h_length);
+    }
+
+    int ret = connect(fd, (struct sockaddr *)&addr, sizeof(addr));
+    if (ret < 0 && errno != EINPROGRESS) {
+        close(fd);
+        return QSYSDB_ERR_CONNECT;
+    }
+
+    srv->fd = fd;
+    srv->connected = (ret == 0);
+
+    return QSYSDB_OK;
+}
+
+int qsysdb_async_connect_cluster(qsysdb_async_t *client, int flags)
+{
+    if (!client)
+        return QSYSDB_ERR_INVALID;
+
+    if (client->server_count == 0)
+        return QSYSDB_ERR_INVALID;
+
+    pthread_mutex_lock(&client->lock);
+
+    client->cluster_mode = true;
+    client->conn_flags = flags;
+    int connected_count = 0;
+
+    /* Try to connect to all servers */
+    for (int i = 0; i < client->server_count; i++) {
+        struct cluster_server *srv = &client->servers[i];
+        if (connect_to_server(client, srv) == QSYSDB_OK) {
+            connected_count++;
+        }
+    }
+
+    /* Use first connected server as primary */
+    for (int i = 0; i < client->server_count; i++) {
+        if (client->servers[i].fd >= 0) {
+            client->current_server = i;
+            client->fd = client->servers[i].fd;
+            client->connected = client->servers[i].connected;
+            client->connecting = !client->connected;
+            break;
+        }
+    }
+
+    pthread_mutex_unlock(&client->lock);
+
+    return connected_count > 0 ? QSYSDB_OK : QSYSDB_ERR_CONNECT;
+}
+
+int qsysdb_async_get_leader(qsysdb_async_t *client,
+                            char *host, size_t host_len, uint16_t *port)
+{
+    if (!client)
+        return QSYSDB_ERR_INVALID;
+
+    pthread_mutex_lock(&client->lock);
+
+    if (client->leader_index < 0 || client->leader_index >= client->server_count) {
+        pthread_mutex_unlock(&client->lock);
+        return QSYSDB_ERR_NOTFOUND;
+    }
+
+    struct cluster_server *leader = &client->servers[client->leader_index];
+
+    if (host && host_len > 0) {
+        strncpy(host, leader->host, host_len - 1);
+        host[host_len - 1] = '\0';
+    }
+
+    if (port) {
+        *port = leader->port;
+    }
+
+    pthread_mutex_unlock(&client->lock);
+
+    return QSYSDB_OK;
+}
+
+int qsysdb_async_server_count(qsysdb_async_t *client)
+{
+    if (!client) return 0;
+
+    pthread_mutex_lock(&client->lock);
+    int connected = 0;
+    for (int i = 0; i < client->server_count; i++) {
+        if (client->servers[i].connected)
+            connected++;
+    }
+    pthread_mutex_unlock(&client->lock);
+
+    return connected;
 }

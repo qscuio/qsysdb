@@ -17,6 +17,7 @@
 
 #include <qsysdb/types.h>
 #include <qsysdb/protocol.h>
+#include <qsysdb/cluster.h>
 #include "database.h"
 #include "subscription.h"
 #include "worker_pool.h"
@@ -85,6 +86,10 @@ struct server_config {
     /* Worker pool settings */
     bool worker_pool_enabled;
     int worker_threads;             /* Number of worker threads (0 = auto detect) */
+
+    /* Cluster settings */
+    bool cluster_enabled;
+    qsysdb_cluster_config_t cluster;
 };
 
 /*
@@ -117,6 +122,9 @@ struct server {
     /* Worker pool for parallel request processing */
     struct worker_pool *worker_pool;
     bool use_worker_pool;
+
+    /* Cluster support */
+    qsysdb_cluster_t *cluster;
 
     /* Statistics */
     uint64_t total_connections;
@@ -167,5 +175,21 @@ int server_broadcast_notification(struct server *srv,
  */
 void server_stats(struct server *srv, int *client_count,
                   uint64_t *total_connections, uint64_t *total_requests);
+
+/*
+ * Enable cluster mode
+ */
+int server_enable_cluster(struct server *srv, qsysdb_cluster_config_t *config);
+
+/*
+ * Check if this server is the cluster leader
+ */
+bool server_is_leader(struct server *srv);
+
+/*
+ * Forward a write request to the leader (for follower nodes)
+ */
+int server_forward_to_leader(struct server *srv, struct client_conn *client,
+                             struct qsysdb_msg_header *hdr, void *payload);
 
 #endif /* QSYSDB_SERVER_H */
