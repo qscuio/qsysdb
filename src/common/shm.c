@@ -142,6 +142,10 @@ int qsysdb_shm_create(struct qsysdb_shm *shm, const char *name, size_t size)
     shm->header->data_used = 8;  /* Reserve offset 0 as invalid/error */
     shm->header->entry_count = 0;
     shm->header->node_count = 0;
+    shm->header->free_list_head = 0;
+    shm->header->free_list_count = 0;
+    shm->header->bytes_freed = 0;
+    shm->header->bytes_reused = 0;
     shm->header->lock_state = 0;
     shm->header->writer_pid = 0;
     shm->header->write_sequence = 0;
@@ -159,8 +163,9 @@ int qsysdb_shm_create(struct qsysdb_shm *shm, const char *name, size_t size)
     shm->data_base = (char *)shm->base + data_offset;
     shm->ring = (struct qsysdb_ringbuf *)((char *)shm->base + ring_offset);
 
-    /* Initialize radix tree */
+    /* Initialize radix tree - use available index memory (no artificial cap) */
     uint32_t max_nodes = (uint32_t)(index_size / sizeof(struct radix_node));
+    /* Cap only if memory allows less than configured pool size */
     if (max_nodes > QSYSDB_RADIX_POOL_SIZE) {
         max_nodes = QSYSDB_RADIX_POOL_SIZE;
     }
@@ -316,33 +321,153 @@ int qsysdb_shm_unlock(struct qsysdb_shm *shm)
 }
 
 /*
- * Simple bump allocator for data region
- * TODO: Implement free list for proper deallocation
+ * Free list allocator for data region with best-fit allocation strategy
+ *
+ * Allocation strategy:
+ * 1. First, search free list for best-fit block (smallest block that fits)
+ * 2. If found, split block if remainder is >= SHM_MIN_ALLOC_SIZE
+ * 3. If not found, bump-allocate from end of data region
+ *
+ * Free strategy:
+ * 1. Add block to free list
+ * 2. Try to coalesce with adjacent free blocks (TODO: requires boundary tags)
  */
+
+/* Get free block pointer from offset */
+static inline struct shm_free_block *get_free_block(struct qsysdb_shm *shm,
+                                                     uint32_t offset)
+{
+    if (offset == 0) return NULL;
+    return (struct shm_free_block *)((char *)shm->data_base + offset);
+}
+
 uint32_t qsysdb_shm_alloc(struct qsysdb_shm *shm, size_t size)
 {
-    /* Align size to 8 bytes */
+    /* Align size to 8 bytes and enforce minimum */
     size = QSYSDB_ALIGN8(size);
+    if (size < SHM_MIN_ALLOC_SIZE) {
+        size = SHM_MIN_ALLOC_SIZE;
+    }
 
+    uint32_t alloc_size = (uint32_t)size;
+
+    /* Search free list for best-fit block */
+    uint32_t best_offset = 0;
+    uint32_t best_size = UINT32_MAX;
+    uint32_t best_prev_offset = 0;
+    uint32_t prev_offset = 0;
+    uint32_t curr_offset = shm->header->free_list_head;
+
+    while (curr_offset != 0) {
+        struct shm_free_block *block = get_free_block(shm, curr_offset);
+        if (block->magic != SHM_FREE_MAGIC) {
+            /* Corrupted free list - skip */
+            break;
+        }
+
+        if (block->size >= alloc_size && block->size < best_size) {
+            best_offset = curr_offset;
+            best_size = block->size;
+            best_prev_offset = prev_offset;
+
+            /* Exact fit - stop searching */
+            if (block->size == alloc_size) {
+                break;
+            }
+        }
+
+        prev_offset = curr_offset;
+        curr_offset = block->next_offset;
+    }
+
+    /* Found a suitable block in free list */
+    if (best_offset != 0) {
+        struct shm_free_block *block = get_free_block(shm, best_offset);
+        uint32_t remaining = block->size - alloc_size;
+
+        /* Check if we should split this block */
+        if (remaining >= SHM_MIN_ALLOC_SIZE) {
+            /* Create new free block with remainder */
+            uint32_t new_free_offset = best_offset + alloc_size;
+            struct shm_free_block *new_block = get_free_block(shm, new_free_offset);
+            new_block->magic = SHM_FREE_MAGIC;
+            new_block->size = remaining;
+            new_block->next_offset = block->next_offset;
+            new_block->prev_offset = best_prev_offset;
+
+            /* Update list links */
+            if (best_prev_offset == 0) {
+                shm->header->free_list_head = new_free_offset;
+            } else {
+                struct shm_free_block *prev_block = get_free_block(shm, best_prev_offset);
+                prev_block->next_offset = new_free_offset;
+            }
+        } else {
+            /* Use entire block - remove from free list */
+            if (best_prev_offset == 0) {
+                shm->header->free_list_head = block->next_offset;
+            } else {
+                struct shm_free_block *prev_block = get_free_block(shm, best_prev_offset);
+                prev_block->next_offset = block->next_offset;
+            }
+            shm->header->free_list_count--;
+        }
+
+        /* Track reused bytes */
+        shm->header->bytes_reused += alloc_size;
+
+        /* Clear the free block header (caller's data starts here) */
+        memset(block, 0, sizeof(*block));
+
+        return best_offset;
+    }
+
+    /* No suitable free block found - bump allocate */
     uint32_t data_size = shm->header->data_size;
     uint32_t data_used = shm->header->data_used;
 
-    if (data_used + size > data_size) {
+    if (data_used + alloc_size > data_size) {
         return 0;  /* Out of space */
     }
 
     uint32_t offset = data_used;
-    shm->header->data_used = data_used + (uint32_t)size;
+    shm->header->data_used = data_used + alloc_size;
 
     return offset;
 }
 
 void qsysdb_shm_free(struct qsysdb_shm *shm, uint32_t offset, size_t size)
 {
-    /* TODO: Add to free list for reuse */
-    (void)shm;
-    (void)offset;
-    (void)size;
+    if (offset == 0) return;
+
+    /* Align size */
+    size = QSYSDB_ALIGN8(size);
+    if (size < SHM_MIN_ALLOC_SIZE) {
+        size = SHM_MIN_ALLOC_SIZE;
+    }
+
+    /* Initialize free block header */
+    struct shm_free_block *block = get_free_block(shm, offset);
+    block->magic = SHM_FREE_MAGIC;
+    block->size = (uint32_t)size;
+    block->prev_offset = 0;
+
+    /* Insert at head of free list (O(1) insertion) */
+    block->next_offset = shm->header->free_list_head;
+    shm->header->free_list_head = offset;
+    shm->header->free_list_count++;
+    shm->header->bytes_freed += size;
+
+    /*
+     * Note: Coalescing adjacent free blocks could be implemented here
+     * but requires boundary tags or scanning. For now, we rely on
+     * best-fit allocation to minimize fragmentation.
+     *
+     * A more advanced implementation could:
+     * 1. Keep free list sorted by offset for efficient coalescing
+     * 2. Use boundary tags to detect adjacent free blocks
+     * 3. Implement periodic compaction
+     */
 }
 
 uint64_t qsysdb_shm_next_sequence(struct qsysdb_shm *shm)

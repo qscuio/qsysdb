@@ -19,6 +19,7 @@
 #include <qsysdb/protocol.h>
 #include "database.h"
 #include "subscription.h"
+#include "worker_pool.h"
 
 /* Forward declarations */
 struct server;
@@ -80,6 +81,10 @@ struct server_config {
     bool tcp_enabled;
     char tcp_bind[64];
     uint16_t tcp_port;
+
+    /* Worker pool settings */
+    bool worker_pool_enabled;
+    int worker_threads;             /* Number of worker threads (0 = auto detect) */
 };
 
 /*
@@ -108,6 +113,10 @@ struct server {
     /* Server state */
     volatile bool running;
     pthread_t event_thread;
+
+    /* Worker pool for parallel request processing */
+    struct worker_pool *worker_pool;
+    bool use_worker_pool;
 
     /* Statistics */
     uint64_t total_connections;

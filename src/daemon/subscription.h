@@ -1,6 +1,6 @@
 /*
  * QSysDB - Hierarchical State Database with Kernel Support
- * subscription.h - Subscription management
+ * subscription.h - Subscription management with trie-based matching
  *
  * Copyright (c) 2024
  * SPDX-License-Identifier: MIT
@@ -28,17 +28,34 @@ struct subscription {
     size_t pattern_len;
     bool prefix_match;              /* True if pattern ends with '*' */
     uint64_t last_sequence;         /* Last delivered sequence */
-    struct subscription *next;      /* Next in list */
+    struct subscription *next;      /* Next in hash bucket */
+    struct subscription *trie_next; /* Next subscription at same trie node */
 };
 
 /*
- * Subscription manager
+ * Trie node for efficient subscription matching
+ * Each node represents a path component (characters between '/')
+ */
+#define SUB_TRIE_CHILDREN 128   /* ASCII character set */
+
+struct sub_trie_node {
+    struct sub_trie_node *children[SUB_TRIE_CHILDREN];
+    struct subscription *exact_subs;    /* Exact match subscriptions at this node */
+    struct subscription *prefix_subs;   /* Prefix match subscriptions (pattern+wildcard) */
+    int exact_count;
+    int prefix_count;
+};
+
+/*
+ * Subscription manager with trie index for O(k) matching where k = path length
  */
 struct sub_manager {
-    struct subscription *subscriptions;  /* Linked list of subscriptions */
+    struct subscription *subscriptions;  /* Linked list for iteration */
+    struct sub_trie_node *trie_root;     /* Trie root for efficient matching */
     int next_id;                         /* Next subscription ID */
     int count;                           /* Total subscription count */
-    pthread_mutex_t lock;                /* Protects the list */
+    int trie_node_count;                 /* Number of trie nodes allocated */
+    pthread_mutex_t lock;                /* Protects the list and trie */
 };
 
 /*

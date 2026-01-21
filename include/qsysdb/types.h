@@ -33,15 +33,15 @@
 #define QSYSDB_MAX_PATH         256         /* Maximum path length */
 #define QSYSDB_MAX_VALUE        (64 * 1024) /* 64KB max JSON value */
 #define QSYSDB_MAX_CLIENTS      1024        /* Maximum concurrent clients */
-#define QSYSDB_MAX_SUBSCRIPTIONS 4096       /* Maximum total subscriptions */
+#define QSYSDB_MAX_SUBSCRIPTIONS 65536      /* Maximum total subscriptions (increased for scale) */
 
 /*
  * Shared memory configuration
  */
 #define QSYSDB_SHM_NAME         "/qsysdb"
-#define QSYSDB_SHM_SIZE_DEFAULT (64 * 1024 * 1024)  /* 64MB default */
+#define QSYSDB_SHM_SIZE_DEFAULT (256 * 1024 * 1024) /* 256MB default (increased for 10+ clients with 100K+ entries) */
 #define QSYSDB_SHM_SIZE_MIN     (1 * 1024 * 1024)   /* 1MB minimum */
-#define QSYSDB_SHM_SIZE_MAX     (1024 * 1024 * 1024) /* 1GB maximum */
+#define QSYSDB_SHM_SIZE_MAX     (4ULL * 1024 * 1024 * 1024) /* 4GB maximum */
 
 /*
  * Socket configuration
@@ -60,13 +60,13 @@
 /*
  * Ring buffer configuration
  */
-#define QSYSDB_RING_SIZE        4096        /* Number of notification entries */
+#define QSYSDB_RING_SIZE        65536       /* Number of notification entries (increased for scale) */
 #define QSYSDB_RING_ENTRY_SIZE  512         /* Size of each notification */
 
 /*
  * Radix tree configuration
  */
-#define QSYSDB_RADIX_POOL_SIZE  (16 * 1024) /* Number of pre-allocated nodes */
+#define QSYSDB_RADIX_POOL_SIZE  (256 * 1024) /* Number of pre-allocated nodes (increased for 100K+ entries) */
 #define QSYSDB_RADIX_PREFIX_MAX 14          /* Maximum compressed prefix length */
 
 /*
@@ -174,6 +174,10 @@ struct qsysdb_shm_header {
     uint32_t data_used;             /* Bytes used in data region */
     uint32_t entry_count;           /* Number of entries */
     uint32_t node_count;            /* Number of radix tree nodes */
+    uint32_t free_list_head;        /* Head of free block list (offset in data region) */
+    uint32_t free_list_count;       /* Number of blocks in free list */
+    uint64_t bytes_freed;           /* Total bytes freed (for stats) */
+    uint64_t bytes_reused;          /* Total bytes reused from free list */
 
     /* Synchronization */
     uint32_t lock_state;            /* Spinlock for kernel access */

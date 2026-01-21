@@ -27,9 +27,9 @@
 #include "subscription.h"
 #include "common/ringbuf.h"
 
-#define MAX_EVENTS      64
-#define RECV_BUF_SIZE   (128 * 1024)
-#define SEND_BUF_SIZE   (128 * 1024)
+#define MAX_EVENTS      256
+#define RECV_BUF_SIZE   (1 * 1024 * 1024)   /* 1MB receive buffer for large requests */
+#define SEND_BUF_SIZE   (2 * 1024 * 1024)   /* 2MB send buffer for large LIST responses */
 
 /* Forward declarations */
 static int handle_client_message(struct client_conn *client,
@@ -339,6 +339,8 @@ static int handle_client_message(struct client_conn *client,
 
 static void handle_client_data(struct client_conn *client)
 {
+    struct server *srv = client->server;
+
     /* Try to receive data */
     ssize_t n = recv(client->fd, client->recv_buf + client->recv_len,
                      client->recv_buf_size - client->recv_len, 0);
@@ -369,8 +371,24 @@ static void handle_client_data(struct client_conn *client)
             break;  /* Need more data */
         }
 
-        /* Process the message */
-        handle_client_message(client, hdr, client->recv_buf + sizeof(*hdr));
+        /*
+         * If worker pool is enabled, submit the message for async processing.
+         * Otherwise, process synchronously in the event loop.
+         */
+        if (srv->worker_pool && srv->use_worker_pool) {
+            ret = worker_pool_submit(srv->worker_pool, client,
+                                     client->recv_buf, hdr->msg_len);
+            if (ret == QSYSDB_ERR_FULL) {
+                /* Worker queue full - process synchronously to avoid dropping */
+                handle_client_message(client, hdr, client->recv_buf + sizeof(*hdr));
+            } else if (ret != QSYSDB_OK) {
+                /* Other error - process synchronously */
+                handle_client_message(client, hdr, client->recv_buf + sizeof(*hdr));
+            }
+        } else {
+            /* No worker pool - process synchronously */
+            handle_client_message(client, hdr, client->recv_buf + sizeof(*hdr));
+        }
 
         /* Remove processed message from buffer */
         size_t remaining = client->recv_len - hdr->msg_len;
@@ -560,6 +578,10 @@ void server_config_init(struct server_config *config)
     snprintf(config->tcp_bind, sizeof(config->tcp_bind), "%s",
              QSYSDB_TCP_BIND_DEFAULT);
     config->tcp_port = QSYSDB_TCP_PORT_DEFAULT;
+
+    /* Enable worker pool by default for better multi-client performance */
+    config->worker_pool_enabled = true;
+    config->worker_threads = 0;  /* Auto-detect based on CPU count */
 }
 
 static int setup_unix_socket(struct server *srv)
@@ -722,6 +744,49 @@ int server_init(struct server *srv, struct server_config *config,
         }
     }
 
+    /* Initialize worker pool if enabled */
+    if (srv->config.worker_pool_enabled) {
+        srv->worker_pool = calloc(1, sizeof(struct worker_pool));
+        if (!srv->worker_pool) {
+            if (srv->unix_fd >= 0) {
+                close(srv->unix_fd);
+                unlink(srv->config.unix_path);
+            }
+            if (srv->tcp_fd >= 0) {
+                close(srv->tcp_fd);
+            }
+            close(srv->epoll_fd);
+            return QSYSDB_ERR_NOMEM;
+        }
+
+        int num_threads = srv->config.worker_threads;
+        if (num_threads <= 0) {
+            /* Auto-detect: use number of CPU cores, but at least 4 */
+            num_threads = (int)sysconf(_SC_NPROCESSORS_ONLN);
+            if (num_threads < 4) num_threads = 4;
+            if (num_threads > WORKER_POOL_DEFAULT_THREADS) {
+                num_threads = WORKER_POOL_DEFAULT_THREADS;
+            }
+        }
+
+        /* Note: process_fn will be set when starting */
+        int ret = worker_pool_init(srv->worker_pool, num_threads, NULL);
+        if (ret != QSYSDB_OK) {
+            free(srv->worker_pool);
+            srv->worker_pool = NULL;
+            if (srv->unix_fd >= 0) {
+                close(srv->unix_fd);
+                unlink(srv->config.unix_path);
+            }
+            if (srv->tcp_fd >= 0) {
+                close(srv->tcp_fd);
+            }
+            close(srv->epoll_fd);
+            return ret;
+        }
+        srv->use_worker_pool = true;
+    }
+
     return QSYSDB_OK;
 }
 
@@ -744,11 +809,32 @@ int server_enable_tcp(struct server *srv, const char *bind_addr, uint16_t port)
     return setup_tcp_socket(srv);
 }
 
+/* Wrapper for worker pool to call handle_client_message */
+static void worker_process_message(struct client_conn *client,
+                                   struct qsysdb_msg_header *hdr,
+                                   void *payload)
+{
+    handle_client_message(client, hdr, payload);
+}
+
 int server_start(struct server *srv)
 {
     srv->running = true;
 
+    /* Start worker pool if enabled */
+    if (srv->worker_pool && srv->use_worker_pool) {
+        srv->worker_pool->process_fn = worker_process_message;
+        int ret = worker_pool_start(srv->worker_pool);
+        if (ret != QSYSDB_OK) {
+            srv->running = false;
+            return ret;
+        }
+    }
+
     if (pthread_create(&srv->event_thread, NULL, event_loop, srv) != 0) {
+        if (srv->worker_pool && srv->use_worker_pool) {
+            worker_pool_stop(srv->worker_pool);
+        }
         srv->running = false;
         return QSYSDB_ERR_INTERNAL;
     }
@@ -760,6 +846,11 @@ void server_stop(struct server *srv)
 {
     srv->running = false;
 
+    /* Stop worker pool first */
+    if (srv->worker_pool && srv->use_worker_pool) {
+        worker_pool_stop(srv->worker_pool);
+    }
+
     if (srv->event_thread) {
         pthread_join(srv->event_thread, NULL);
     }
@@ -768,6 +859,13 @@ void server_stop(struct server *srv)
 void server_shutdown(struct server *srv)
 {
     server_stop(srv);
+
+    /* Shutdown and free worker pool */
+    if (srv->worker_pool) {
+        worker_pool_shutdown(srv->worker_pool);
+        free(srv->worker_pool);
+        srv->worker_pool = NULL;
+    }
 
     /* Disconnect all clients */
     pthread_mutex_lock(&srv->clients_lock);

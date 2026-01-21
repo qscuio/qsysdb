@@ -49,7 +49,21 @@ struct qsysdb_shm {
 };
 
 /*
- * Data region allocator entry
+ * Free block header structure (placed at start of free block in data region)
+ * Minimum allocation size must be >= sizeof(struct shm_free_block)
+ */
+struct shm_free_block {
+    uint32_t magic;                 /* Validation magic (SHM_FREE_MAGIC) */
+    uint32_t size;                  /* Size of this free block (including header) */
+    uint32_t next_offset;           /* Offset to next free block (0 = end of list) */
+    uint32_t prev_offset;           /* Offset to previous free block (for coalescing) */
+};
+
+#define SHM_FREE_MAGIC      0x46524545  /* "FREE" */
+#define SHM_MIN_ALLOC_SIZE  32          /* Minimum allocation size (must fit free_block header) */
+
+/*
+ * Data region allocator entry (deprecated, kept for reference)
  */
 struct shm_alloc_entry {
     uint32_t offset;                /* Offset in data region */

@@ -25,7 +25,7 @@
 #include "common/shm.h"
 #include "common/ringbuf.h"
 
-#define RECV_BUF_SIZE   (128 * 1024)
+#define RECV_BUF_SIZE   (2 * 1024 * 1024)  /* 2MB receive buffer for large LIST responses */
 
 /*
  * Perform connection handshake with server

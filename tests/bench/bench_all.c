@@ -435,6 +435,177 @@ BENCHMARK_F(subscription, match_no_subscribers, sub_bench_setup, NULL, NULL)
 }
 
 /* ============================================
+ * Scalability Benchmarks (for 10+ clients, 100K+ entries)
+ * ============================================ */
+
+/* Large subscription test - simulates 10 clients with 100 subscriptions each */
+static int scale_subs_populated = 0;
+static struct sub_manager scale_sub_mgr;
+static int scale_sub_inited = 0;
+static char scale_patterns[1000][64];
+static char scale_paths[10000][64];
+
+static void scale_sub_setup(void *userdata) {
+    (void)userdata;
+    if (!scale_sub_inited) {
+        sub_manager_init(&scale_sub_mgr);
+
+        /* Generate patterns for 10 clients with 100 subscriptions each */
+        for (int client = 0; client < 10; client++) {
+            for (int i = 0; i < 100; i++) {
+                int idx = client * 100 + i;
+                snprintf(scale_patterns[idx], sizeof(scale_patterns[idx]),
+                         "/client%d/events/type%d/*", client, i);
+            }
+        }
+        /* Generate test paths */
+        for (int i = 0; i < 10000; i++) {
+            int client = i % 10;
+            int type = (i / 10) % 100;
+            snprintf(scale_paths[i], sizeof(scale_paths[i]),
+                     "/client%d/events/type%d/event%d", client, type, i);
+        }
+        scale_sub_inited = 1;
+    }
+}
+
+static void scale_sub_populate(void *userdata) {
+    scale_sub_setup(userdata);
+    if (!scale_subs_populated) {
+        /* Add 1000 subscriptions (10 clients x 100 each) */
+        for (int i = 0; i < 1000; i++) {
+            int sub_id;
+            sub_add(&scale_sub_mgr, i / 100, scale_patterns[i],
+                    strlen(scale_patterns[i]), &sub_id);
+        }
+        scale_subs_populated = 1;
+    }
+}
+
+BENCHMARK_F(scalability, match_with_1000_subs, scale_sub_populate, NULL, NULL)
+{
+    static int idx = 0;
+    int client_ids[100], sub_ids[100];
+    int matches = sub_match(&scale_sub_mgr, scale_paths[idx % 10000],
+                            strlen(scale_paths[idx % 10000]),
+                            client_ids, sub_ids, 100);
+    idx++;
+    BENCH_DO_NOT_OPTIMIZE(matches);
+}
+
+BENCHMARK_F(scalability, add_1000_subscriptions, scale_sub_setup, NULL, NULL)
+{
+    struct sub_manager temp_mgr;
+    sub_manager_init(&temp_mgr);
+
+    for (int i = 0; i < 1000; i++) {
+        int sub_id;
+        sub_add(&temp_mgr, i / 100, scale_patterns[i],
+                strlen(scale_patterns[i]), &sub_id);
+    }
+
+    sub_manager_shutdown(&temp_mgr);
+    BENCH_CLOBBER();
+}
+
+/* High-volume database operations */
+static int scale_db_inited = 0;
+static struct qsysdb_db scale_db;
+static char scale_db_paths[100000][48];
+static char scale_db_value[512];
+static int scale_db_paths_generated = 0;
+
+static void scale_db_setup(void *userdata) {
+    (void)userdata;
+    if (!scale_db_inited) {
+        qsysdb_shm_unlink("/qsysdb_scale_bench");
+        int ret = db_init(&scale_db, "/qsysdb_scale_bench", 512 * 1024 * 1024);
+        if (ret != QSYSDB_OK) {
+            fprintf(stderr, "Failed to init scale db: %d\n", ret);
+            return;
+        }
+        scale_db_inited = 1;
+    }
+
+    if (!scale_db_paths_generated) {
+        /* Generate 100K unique paths */
+        for (int i = 0; i < 100000; i++) {
+            int client = i % 10;
+            int category = (i / 10) % 100;
+            snprintf(scale_db_paths[i], sizeof(scale_db_paths[i]),
+                     "/c%d/cat%d/entry%d", client, category, i);
+        }
+        snprintf(scale_db_value, sizeof(scale_db_value),
+                 "{\"id\":0,\"data\":\"benchmark_test_value\",\"status\":\"active\"}");
+        scale_db_paths_generated = 1;
+    }
+}
+
+BENCHMARK_F(scalability, set_10000_entries, scale_db_setup, NULL, NULL)
+{
+    for (int i = 0; i < 10000; i++) {
+        db_set(&scale_db, scale_db_paths[i], strlen(scale_db_paths[i]),
+               scale_db_value, strlen(scale_db_value), 0, NULL);
+    }
+    BENCH_CLOBBER();
+}
+
+/* Pre-populate with 50K entries for get/exists tests */
+static int scale_db_populated = 0;
+
+static void scale_db_populate(void *userdata) {
+    scale_db_setup(userdata);
+    if (!scale_db_populated && scale_db_inited) {
+        for (int i = 0; i < 50000; i++) {
+            db_set(&scale_db, scale_db_paths[i], strlen(scale_db_paths[i]),
+                   scale_db_value, strlen(scale_db_value), 0, NULL);
+        }
+        scale_db_populated = 1;
+    }
+}
+
+BENCHMARK_F(scalability, get_from_50K_entries, scale_db_populate, NULL, NULL)
+{
+    static int idx = 0;
+    char buf[512];
+    size_t out_len;
+    int ret = db_get(&scale_db, scale_db_paths[idx % 50000],
+                     strlen(scale_db_paths[idx % 50000]),
+                     buf, sizeof(buf), &out_len, NULL, NULL);
+    idx++;
+    BENCH_DO_NOT_OPTIMIZE(ret);
+}
+
+BENCHMARK_F(scalability, exists_in_50K_entries, scale_db_populate, NULL, NULL)
+{
+    static int idx = 0;
+    bool exists;
+    int ret = db_exists(&scale_db, scale_db_paths[idx % 50000],
+                        strlen(scale_db_paths[idx % 50000]), &exists);
+    idx++;
+    BENCH_DO_NOT_OPTIMIZE(ret);
+}
+
+/* Memory reclamation test - delete and reinsert */
+BENCHMARK_F(scalability, delete_reinsert_cycle, scale_db_populate, NULL, NULL)
+{
+    static int idx = 0;
+    int path_idx = idx % 50000;
+
+    /* Delete an entry */
+    db_delete(&scale_db, scale_db_paths[path_idx],
+              strlen(scale_db_paths[path_idx]));
+
+    /* Reinsert with new value */
+    db_set(&scale_db, scale_db_paths[path_idx],
+           strlen(scale_db_paths[path_idx]),
+           scale_db_value, strlen(scale_db_value), 0, NULL);
+
+    idx++;
+    BENCH_CLOBBER();
+}
+
+/* ============================================
  * Throughput Benchmarks
  * ============================================ */
 
@@ -554,6 +725,14 @@ static void bench_cleanup(void) {
     }
     if (sub_bench_inited) {
         sub_manager_shutdown(&sub_bench_mgr);
+    }
+    /* Cleanup scalability benchmarks */
+    if (scale_sub_inited) {
+        sub_manager_shutdown(&scale_sub_mgr);
+    }
+    if (scale_db_inited) {
+        db_shutdown(&scale_db);
+        qsysdb_shm_unlink("/qsysdb_scale_bench");
     }
 }
 
