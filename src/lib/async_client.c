@@ -930,6 +930,8 @@ void qsysdb_op_cancel(qsysdb_op_t *op)
 
 qsysdb_watch_t *qsysdb_watch_create(qsysdb_async_t *client)
 {
+    if (!client) return NULL;
+
     qsysdb_watch_t *w = calloc(1, sizeof(*w));
     if (!w) return NULL;
 
@@ -940,6 +942,9 @@ qsysdb_watch_t *qsysdb_watch_create(qsysdb_async_t *client)
 
 qsysdb_watch_t *qsysdb_watch_pattern(qsysdb_watch_t *watch, const char *pattern)
 {
+    if (!watch) return NULL;
+    if (!pattern) return watch;
+
     free(watch->pattern);
     watch->pattern = strdup(pattern);
     return watch;
@@ -948,6 +953,7 @@ qsysdb_watch_t *qsysdb_watch_pattern(qsysdb_watch_t *watch, const char *pattern)
 qsysdb_watch_t *qsysdb_watch_on_event(qsysdb_watch_t *watch,
                                        qsysdb_event_fn handler, void *userdata)
 {
+    if (!watch) return NULL;
     watch->on_event = handler;
     watch->on_event_data = userdata;
     return watch;
@@ -956,6 +962,7 @@ qsysdb_watch_t *qsysdb_watch_on_event(qsysdb_watch_t *watch,
 qsysdb_watch_t *qsysdb_watch_on_create(qsysdb_watch_t *watch,
                                         qsysdb_event_fn handler, void *userdata)
 {
+    if (!watch) return NULL;
     watch->on_create = handler;
     watch->on_create_data = userdata;
     return watch;
@@ -964,6 +971,7 @@ qsysdb_watch_t *qsysdb_watch_on_create(qsysdb_watch_t *watch,
 qsysdb_watch_t *qsysdb_watch_on_update(qsysdb_watch_t *watch,
                                         qsysdb_event_fn handler, void *userdata)
 {
+    if (!watch) return NULL;
     watch->on_update = handler;
     watch->on_update_data = userdata;
     return watch;
@@ -972,6 +980,7 @@ qsysdb_watch_t *qsysdb_watch_on_update(qsysdb_watch_t *watch,
 qsysdb_watch_t *qsysdb_watch_on_delete(qsysdb_watch_t *watch,
                                         qsysdb_event_fn handler, void *userdata)
 {
+    if (!watch) return NULL;
     watch->on_delete = handler;
     watch->on_delete_data = userdata;
     return watch;
@@ -979,18 +988,21 @@ qsysdb_watch_t *qsysdb_watch_on_delete(qsysdb_watch_t *watch,
 
 qsysdb_watch_t *qsysdb_watch_get_initial(qsysdb_watch_t *watch, bool enable)
 {
+    if (!watch) return NULL;
     watch->get_initial = enable;
     return watch;
 }
 
 qsysdb_watch_t *qsysdb_watch_queue_size(qsysdb_watch_t *watch, int queue_size)
 {
+    if (!watch) return NULL;
     watch->queue_size = queue_size;
     return watch;
 }
 
 int qsysdb_watch_start(qsysdb_watch_t *watch)
 {
+    if (!watch || !watch->client) return QSYSDB_ERR_INVALID;
     if (!watch->pattern || !watch->client->connected) {
         return QSYSDB_ERR_INVALID;
     }
@@ -1029,24 +1041,26 @@ void qsysdb_watch_stop(qsysdb_watch_t *watch)
 
     qsysdb_async_t *client = watch->client;
 
-    /* Remove from list */
-    qsysdb_watch_t **pp = &client->watches;
-    while (*pp) {
-        if (*pp == watch) {
-            *pp = watch->next;
-            client->watch_count--;
-            break;
+    if (client) {
+        /* Remove from list */
+        qsysdb_watch_t **pp = &client->watches;
+        while (*pp) {
+            if (*pp == watch) {
+                *pp = watch->next;
+                client->watch_count--;
+                break;
+            }
+            pp = &(*pp)->next;
         }
-        pp = &(*pp)->next;
-    }
 
-    /* Send unsubscribe */
-    if (watch->started && watch->subscription_id > 0) {
-        struct qsysdb_msg_unsubscribe_req req = {0};
-        qsysdb_msg_init(&req.hdr, QSYSDB_MSG_UNSUBSCRIBE_REQ,
-                        sizeof(req), client->next_request_id++);
-        req.subscription_id = watch->subscription_id;
-        queue_send(client, &req, sizeof(req));
+        /* Send unsubscribe */
+        if (watch->started && watch->subscription_id > 0) {
+            struct qsysdb_msg_unsubscribe_req req = {0};
+            qsysdb_msg_init(&req.hdr, QSYSDB_MSG_UNSUBSCRIBE_REQ,
+                            sizeof(req), client->next_request_id++);
+            req.subscription_id = watch->subscription_id;
+            queue_send(client, &req, sizeof(req));
+        }
     }
 
     free(watch->pattern);
@@ -1055,12 +1069,12 @@ void qsysdb_watch_stop(qsysdb_watch_t *watch)
 
 void qsysdb_watch_pause(qsysdb_watch_t *watch)
 {
-    watch->paused = true;
+    if (watch) watch->paused = true;
 }
 
 void qsysdb_watch_resume(qsysdb_watch_t *watch)
 {
-    watch->paused = false;
+    if (watch) watch->paused = false;
 }
 
 /* ============================================
@@ -1069,6 +1083,8 @@ void qsysdb_watch_resume(qsysdb_watch_t *watch)
 
 qsysdb_batch_t *qsysdb_batch_create(qsysdb_async_t *client)
 {
+    if (!client) return NULL;
+
     qsysdb_batch_t *batch = calloc(1, sizeof(*batch));
     if (!batch) return NULL;
 
@@ -1086,6 +1102,7 @@ qsysdb_batch_t *qsysdb_batch_create(qsysdb_async_t *client)
 qsysdb_batch_t *qsysdb_batch_set(qsysdb_batch_t *batch,
                                   const char *path, const char *value)
 {
+    if (!batch) return NULL;
     if (batch->count >= batch->capacity) {
         int new_cap = batch->capacity * 2;
         struct batch_entry *new_entries = realloc(batch->entries,
@@ -1105,6 +1122,7 @@ qsysdb_batch_t *qsysdb_batch_set(qsysdb_batch_t *batch,
 
 qsysdb_batch_t *qsysdb_batch_delete(qsysdb_batch_t *batch, const char *path)
 {
+    if (!batch) return NULL;
     if (batch->count >= batch->capacity) {
         int new_cap = batch->capacity * 2;
         struct batch_entry *new_entries = realloc(batch->entries,
@@ -1124,12 +1142,18 @@ qsysdb_batch_t *qsysdb_batch_delete(qsysdb_batch_t *batch, const char *path)
 
 int qsysdb_batch_count(qsysdb_batch_t *batch)
 {
+    if (!batch) return 0;
     return batch->count;
 }
 
 qsysdb_op_t *qsysdb_batch_execute(qsysdb_batch_t *batch,
                                    qsysdb_batch_fn callback, void *userdata)
 {
+    if (!batch || !batch->client) {
+        qsysdb_batch_cancel(batch);
+        return NULL;
+    }
+
     /* TODO: Implement using transaction protocol */
     /* For now, execute operations individually */
     (void)callback; (void)userdata;
@@ -1149,6 +1173,7 @@ qsysdb_op_t *qsysdb_batch_execute(qsysdb_batch_t *batch,
 
 void qsysdb_batch_cancel(qsysdb_batch_t *batch)
 {
+    if (!batch) return;
     for (int i = 0; i < batch->count; i++) {
         free(batch->entries[i].path);
         free(batch->entries[i].value);
@@ -1191,8 +1216,15 @@ static void sync_get_complete(qsysdb_get_result_t *result, void *userdata)
 int qsysdb_async_set_sync(qsysdb_async_t *client,
                            const char *path, const char *value)
 {
+    if (!client || !client->connected) {
+        return QSYSDB_ERR_DISCONNECTED;
+    }
+
     struct sync_ctx ctx = {0};
-    qsysdb_async_set(client, path, value, sync_complete, &ctx);
+    qsysdb_op_t *op = qsysdb_async_set(client, path, value, sync_complete, &ctx);
+    if (!op) {
+        return QSYSDB_ERR_DISCONNECTED;
+    }
 
     while (!ctx.done && client->connected) {
         qsysdb_async_poll(client, 100);
@@ -1204,11 +1236,18 @@ int qsysdb_async_set_sync(qsysdb_async_t *client,
 int qsysdb_async_get_sync(qsysdb_async_t *client,
                            const char *path, char *buf, size_t buflen)
 {
+    if (!client || !client->connected) {
+        return QSYSDB_ERR_DISCONNECTED;
+    }
+
     struct sync_ctx ctx = {
         .value_buf = buf,
         .value_buflen = buflen
     };
-    qsysdb_async_get(client, path, sync_get_complete, &ctx);
+    qsysdb_op_t *op = qsysdb_async_get(client, path, sync_get_complete, &ctx);
+    if (!op) {
+        return QSYSDB_ERR_DISCONNECTED;
+    }
 
     while (!ctx.done && client->connected) {
         qsysdb_async_poll(client, 100);
@@ -1219,8 +1258,15 @@ int qsysdb_async_get_sync(qsysdb_async_t *client,
 
 int qsysdb_async_delete_sync(qsysdb_async_t *client, const char *path)
 {
+    if (!client || !client->connected) {
+        return QSYSDB_ERR_DISCONNECTED;
+    }
+
     struct sync_ctx ctx = {0};
-    qsysdb_async_delete(client, path, sync_complete, &ctx);
+    qsysdb_op_t *op = qsysdb_async_delete(client, path, sync_complete, &ctx);
+    if (!op) {
+        return QSYSDB_ERR_DISCONNECTED;
+    }
 
     while (!ctx.done && client->connected) {
         qsysdb_async_poll(client, 100);
