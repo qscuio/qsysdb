@@ -146,12 +146,15 @@ $(BINDIR)/test_election: $(TESTDIR)/unit/test_election.c $(COMMON_OBJS) $(DAEMON
 
 # Benchmark tests
 .PHONY: bench
-bench: dirs $(COMMON_OBJS) $(DAEMON_OBJS_NO_MAIN) $(LIB_OBJS) $(BINDIR)/bench_all $(BINDIR)/bench_async_client
+bench: dirs $(COMMON_OBJS) $(DAEMON_OBJS_NO_MAIN) $(LIB_OBJS) $(BINDIR)/bench_all $(BINDIR)/bench_async_client $(BINDIR)/bench_cluster
 
 $(BINDIR)/bench_all: $(TESTDIR)/bench/bench_all.c $(COMMON_OBJS) $(DAEMON_OBJS_NO_MAIN)
 	$(CC) $(TEST_CFLAGS) $^ -o $@ $(LDFLAGS) -lm
 
 $(BINDIR)/bench_async_client: $(TESTDIR)/bench/bench_async_client.c $(COMMON_OBJS) $(LIB_OBJS)
+	$(CC) $(TEST_CFLAGS) $^ -o $@ $(LDFLAGS) -lm
+
+$(BINDIR)/bench_cluster: $(TESTDIR)/bench/bench_cluster.c $(COMMON_OBJS) $(DAEMON_OBJS_NO_MAIN) $(LIB_OBJS)
 	$(CC) $(TEST_CFLAGS) $^ -o $@ $(LDFLAGS) -lm
 
 # Run new unit tests
@@ -177,6 +180,7 @@ benchmark: bench
 	@echo ""
 	@$(BINDIR)/bench_all
 	@$(BINDIR)/bench_async_client
+	@$(BINDIR)/bench_cluster
 
 # Run benchmarks with verbose output
 .PHONY: benchmark-verbose
@@ -186,6 +190,7 @@ benchmark-verbose: bench
 	@echo ""
 	@$(BINDIR)/bench_all -v
 	@$(BINDIR)/bench_async_client -v
+	@$(BINDIR)/bench_cluster -v
 
 # Run benchmarks and save results to CSV
 .PHONY: benchmark-csv
