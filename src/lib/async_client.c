@@ -19,6 +19,7 @@
 #include <arpa/inet.h>
 #include <netdb.h>
 #include <poll.h>
+#include <sys/timerfd.h>
 #include <pthread.h>
 
 #include <qsysdb/types.h>
@@ -110,6 +111,10 @@ struct qsysdb_async {
     /* Reconnection */
     bool auto_reconnect;
     int reconnect_interval_ms;
+    int reconnect_attempt;
+    int reconnect_current_interval;
+    bool reconnecting;              /* Awaiting handshake after reconnect */
+    int reconnect_fd;               /* timerfd for retry scheduling */
 
     /* Buffers */
     uint8_t *recv_buf;
@@ -215,6 +220,46 @@ static struct qsysdb_watch *find_watch_by_sub_id(qsysdb_async_t *client, int sub
     return NULL;
 }
 
+/*
+ * Reconnect timer helpers
+ */
+static int arm_reconnect_timer(qsysdb_async_t *client)
+{
+    int ms = client->reconnect_current_interval;
+    struct itimerspec ts = {
+        .it_interval = {0, 0},
+        .it_value = {
+            .tv_sec = ms / 1000,
+            .tv_nsec = (ms % 1000) * 1000000L
+        }
+    };
+    return timerfd_settime(client->reconnect_fd, 0, &ts, NULL);
+}
+
+static int start_reconnect_timer(qsysdb_async_t *client)
+{
+    if (client->reconnect_fd >= 0)
+        return 0;
+
+    client->reconnect_fd = timerfd_create(CLOCK_MONOTONIC, TFD_NONBLOCK | TFD_CLOEXEC);
+    if (client->reconnect_fd < 0)
+        return -1;
+
+    client->reconnect_attempt = 0;
+    client->reconnect_current_interval = client->reconnect_interval_ms;
+    return arm_reconnect_timer(client);
+}
+
+static void stop_reconnect_timer(qsysdb_async_t *client)
+{
+    if (client->reconnect_fd >= 0) {
+        close(client->reconnect_fd);
+        client->reconnect_fd = -1;
+    }
+    client->reconnecting = false;
+    client->reconnect_attempt = 0;
+}
+
 static int queue_send(qsysdb_async_t *client, void *data, size_t len)
 {
     if (client->send_len + len > client->send_buf_size) {
@@ -256,6 +301,7 @@ qsysdb_async_t *qsysdb_async_new(void)
     if (!client) return NULL;
 
     client->fd = -1;
+    client->reconnect_fd = -1;
     client->next_request_id = 1;
 
     client->recv_buf = malloc(RECV_BUF_SIZE);
@@ -324,6 +370,10 @@ void qsysdb_async_set_reconnect(qsysdb_async_t *client,
 {
     client->auto_reconnect = auto_reconnect;
     client->reconnect_interval_ms = interval_ms > 0 ? interval_ms : 1000;
+
+    if (!auto_reconnect) {
+        stop_reconnect_timer(client);
+    }
 }
 
 static int do_connect_unix(qsysdb_async_t *client, const char *path)
@@ -398,6 +448,94 @@ static int send_connect_request(qsysdb_async_t *client)
     return queue_send(client, &req, sizeof(req));
 }
 
+static void resubscribe_watches(qsysdb_async_t *client)
+{
+    struct qsysdb_watch *w = client->watches;
+    while (w) {
+        if (w->started && w->pattern) {
+            size_t pattern_len = strlen(w->pattern);
+            size_t msg_size = sizeof(struct qsysdb_msg_subscribe_req) + pattern_len;
+            struct qsysdb_msg_subscribe_req *req = alloca(msg_size);
+            memset(req, 0, sizeof(*req));
+
+            qsysdb_msg_init(&req->hdr, QSYSDB_MSG_SUBSCRIBE_REQ,
+                            (uint32_t)msg_size, client->next_request_id++);
+            req->pattern_len = (uint16_t)pattern_len;
+            memcpy(req->pattern, w->pattern, pattern_len);
+
+            queue_send(client, req, msg_size);
+        }
+        w = w->next;
+    }
+}
+
+static void disconnect_and_reconnect(qsysdb_async_t *client)
+{
+    if (client->fd >= 0) {
+        close(client->fd);
+        client->fd = -1;
+    }
+
+    bool was_connected = client->connected;
+    client->connected = false;
+    client->connecting = false;
+    client->recv_len = 0;
+    client->send_len = 0;
+    client->send_offset = 0;
+
+    if (was_connected) {
+        invoke_state_change(client, false);
+    }
+
+    if (client->auto_reconnect) {
+        start_reconnect_timer(client);
+    }
+}
+
+static int attempt_reconnect(qsysdb_async_t *client)
+{
+    /* Drain timerfd */
+    uint64_t exp;
+    ssize_t rd = read(client->reconnect_fd, &exp, sizeof(exp));
+    if (rd < 0 && errno == EAGAIN)
+        return QSYSDB_ERR_AGAIN;
+
+    /* Try to connect */
+    int ret;
+    if (client->conn_type == CONN_UNIX) {
+        ret = do_connect_unix(client, client->socket_path);
+    } else {
+        ret = do_connect_tcp(client, client->tcp_host, client->tcp_port);
+    }
+
+    if (ret != QSYSDB_OK) {
+        client->reconnect_attempt++;
+        invoke_error(client, QSYSDB_ERR_CONNECT, "Reconnect attempt failed");
+
+        /* Exponential backoff, cap at 30s */
+        client->reconnect_current_interval *= 2;
+        if (client->reconnect_current_interval > 30000)
+            client->reconnect_current_interval = 30000;
+
+        arm_reconnect_timer(client);
+        return QSYSDB_ERR_AGAIN;
+    }
+
+    /* Connected (or EINPROGRESS) - stop timer, switch to socket fd */
+    stop_reconnect_timer(client);
+    client->reconnecting = true;
+
+    if (!client->connecting) {
+        client->connected = true;
+        send_connect_request(client);
+        resubscribe_watches(client);
+        client->reconnecting = false;
+        invoke_state_change(client, true);
+    }
+
+    return QSYSDB_OK;
+}
+
 int qsysdb_async_connect(qsysdb_async_t *client,
                          const char *socket_path, int flags)
 {
@@ -413,6 +551,10 @@ int qsysdb_async_connect(qsysdb_async_t *client,
 
     int ret = do_connect_unix(client, path);
     if (ret != QSYSDB_OK) {
+        if (client->auto_reconnect) {
+            start_reconnect_timer(client);
+            return QSYSDB_OK;
+        }
         return ret;
     }
 
@@ -444,6 +586,10 @@ int qsysdb_async_connect_tcp(qsysdb_async_t *client,
 
     int ret = do_connect_tcp(client, h, p);
     if (ret != QSYSDB_OK) {
+        if (client->auto_reconnect) {
+            start_reconnect_timer(client);
+            return QSYSDB_OK;
+        }
         return ret;
     }
 
@@ -458,6 +604,7 @@ int qsysdb_async_connect_tcp(qsysdb_async_t *client,
 
 void qsysdb_async_disconnect(qsysdb_async_t *client)
 {
+    stop_reconnect_timer(client);
     if (client->fd >= 0) {
         close(client->fd);
         client->fd = -1;
@@ -486,11 +633,17 @@ bool qsysdb_async_is_connected(qsysdb_async_t *client)
 
 int qsysdb_async_fd(qsysdb_async_t *client)
 {
-    return client->fd;
+    if (client->fd >= 0)
+        return client->fd;
+    return client->reconnect_fd;
 }
 
 int qsysdb_async_events(qsysdb_async_t *client)
 {
+    if (client->fd < 0 && client->reconnect_fd >= 0) {
+        return QSYSDB_WAIT_READ;
+    }
+
     int events = QSYSDB_WAIT_READ;  /* Always want to read */
     if (client->send_len > client->send_offset || client->connecting) {
         events |= QSYSDB_WAIT_WRITE;  /* Have data to send or connecting */
@@ -634,7 +787,7 @@ static int process_messages(qsysdb_async_t *client)
         int ret = qsysdb_msg_validate(hdr, client->recv_len);
         if (ret != QSYSDB_OK) {
             invoke_error(client, ret, "Invalid message received");
-            qsysdb_async_disconnect(client);
+            disconnect_and_reconnect(client);
             return -1;
         }
 
@@ -664,6 +817,11 @@ static int process_messages(qsysdb_async_t *client)
 
 int qsysdb_async_process(qsysdb_async_t *client)
 {
+    /* Handle reconnect timer */
+    if (client->fd < 0 && client->reconnect_fd >= 0) {
+        return attempt_reconnect(client);
+    }
+
     if (client->fd < 0) {
         return QSYSDB_ERR_DISCONNECTED;
     }
@@ -676,13 +834,18 @@ int qsysdb_async_process(qsysdb_async_t *client)
 
         if (err != 0) {
             invoke_error(client, QSYSDB_ERR_CONNECT, "Connection failed");
-            qsysdb_async_disconnect(client);
+            disconnect_and_reconnect(client);
             return QSYSDB_ERR_CONNECT;
         }
 
         client->connecting = false;
         client->connected = true;
         send_connect_request(client);
+
+        if (client->reconnecting) {
+            resubscribe_watches(client);
+            client->reconnecting = false;
+        }
         invoke_state_change(client, true);
     }
 
@@ -695,7 +858,7 @@ int qsysdb_async_process(qsysdb_async_t *client)
                 break;  /* Would block */
             }
             invoke_error(client, QSYSDB_ERR_IO, "Send failed");
-            qsysdb_async_disconnect(client);
+            disconnect_and_reconnect(client);
             return QSYSDB_ERR_IO;
         }
         client->send_offset += n;
@@ -713,13 +876,13 @@ int qsysdb_async_process(qsysdb_async_t *client)
     if (n < 0) {
         if (errno != EAGAIN && errno != EWOULDBLOCK) {
             invoke_error(client, QSYSDB_ERR_IO, "Receive failed");
-            qsysdb_async_disconnect(client);
+            disconnect_and_reconnect(client);
             return QSYSDB_ERR_IO;
         }
     } else if (n == 0) {
         /* Connection closed */
         invoke_error(client, QSYSDB_ERR_DISCONNECTED, "Connection closed");
-        qsysdb_async_disconnect(client);
+        disconnect_and_reconnect(client);
         return QSYSDB_ERR_DISCONNECTED;
     } else {
         client->recv_len += n;
@@ -732,33 +895,37 @@ int qsysdb_async_process(qsysdb_async_t *client)
 
 int qsysdb_async_poll(qsysdb_async_t *client, int timeout_ms)
 {
-    if (client->fd < 0) {
+    int poll_fd;
+    if (client->fd >= 0) {
+        poll_fd = client->fd;
+    } else if (client->reconnect_fd >= 0) {
+        poll_fd = client->reconnect_fd;
+    } else {
         return QSYSDB_ERR_DISCONNECTED;
     }
 
     struct pollfd pfd = {
-        .fd = client->fd,
+        .fd = poll_fd,
         .events = POLLIN
     };
 
-    if (client->send_len > client->send_offset || client->connecting) {
+    if (client->fd >= 0 &&
+        (client->send_len > client->send_offset || client->connecting)) {
         pfd.events |= POLLOUT;
     }
 
     int ret = poll(&pfd, 1, timeout_ms);
     if (ret < 0) {
-        if (errno == EINTR) {
+        if (errno == EINTR)
             return 0;
-        }
         return QSYSDB_ERR_IO;
     }
 
-    if (ret == 0) {
-        return 0;  /* Timeout */
-    }
+    if (ret == 0)
+        return 0;
 
-    if (pfd.revents & (POLLERR | POLLHUP | POLLNVAL)) {
-        qsysdb_async_disconnect(client);
+    if (client->fd >= 0 && (pfd.revents & (POLLERR | POLLHUP | POLLNVAL))) {
+        disconnect_and_reconnect(client);
         return QSYSDB_ERR_DISCONNECTED;
     }
 
@@ -769,9 +936,10 @@ int qsysdb_async_run(qsysdb_async_t *client)
 {
     client->running = true;
 
-    while (client->running && client->connected) {
+    while (client->running && (client->connected || client->reconnect_fd >= 0)) {
         int ret = qsysdb_async_poll(client, 100);
-        if (ret < 0 && ret != QSYSDB_ERR_AGAIN) {
+        if (ret < 0 && ret != QSYSDB_ERR_AGAIN &&
+            ret != QSYSDB_ERR_DISCONNECTED && ret != QSYSDB_ERR_CONNECT) {
             return ret;
         }
     }

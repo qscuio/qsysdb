@@ -326,7 +326,8 @@ int qsysdb_async_server_count(qsysdb_async_t *client);
  * and call qsysdb_async_process() when the fd is readable.
  *
  * @param client  Client handle
- * @return        File descriptor, or -1 if not connected
+ * @return        File descriptor, or -1 if not connected (returns valid
+ *                fd during auto-reconnect for event loop integration)
  */
 int qsysdb_async_fd(qsysdb_async_t *client);
 
