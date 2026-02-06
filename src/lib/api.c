@@ -122,6 +122,17 @@ int qsysdb_set_ex(qsysdb_t *db, const char *path, const char *json_value,
         size_t rsp_len;
 
         ret = client_request(db, req, req_size, &rsp, sizeof(rsp), &rsp_len);
+        if (ret == QSYSDB_ERR_DISCONNECTED || ret == QSYSDB_ERR_IO) {
+            int reason = (ret == QSYSDB_ERR_IO) ? QSYSDB_DISCONNECT_IO
+                                                  : QSYSDB_DISCONNECT_SERVER;
+            int rc = client_handle_disconnect(db, ret, reason);
+            if (rc == QSYSDB_ERR_AGAIN) {
+                /* Reconnected — rebuild request ID and retry */
+                qsysdb_msg_init(&req->hdr, QSYSDB_MSG_SET_REQ,
+                                (uint32_t)req_size, db->next_request_id++);
+                ret = client_request(db, req, req_size, &rsp, sizeof(rsp), &rsp_len);
+            }
+        }
         if (ret != QSYSDB_OK) {
             db->last_error = ret;
             pthread_mutex_unlock(&db->lock);
@@ -234,6 +245,17 @@ int qsysdb_get_ex(qsysdb_t *db, const char *path, char *buf, size_t buflen,
     size_t rsp_len;
 
     ret = client_request(db, req, req_size, rsp_buf, sizeof(rsp_buf), &rsp_len);
+    if (ret == QSYSDB_ERR_DISCONNECTED || ret == QSYSDB_ERR_IO) {
+        int reason = (ret == QSYSDB_ERR_IO) ? QSYSDB_DISCONNECT_IO
+                                              : QSYSDB_DISCONNECT_SERVER;
+        int rc = client_handle_disconnect(db, ret, reason);
+        if (rc == QSYSDB_ERR_AGAIN) {
+            /* Reconnected — rebuild request ID and retry */
+            qsysdb_msg_init(&req->hdr, QSYSDB_MSG_GET_REQ,
+                            (uint32_t)req_size, db->next_request_id++);
+            ret = client_request(db, req, req_size, rsp_buf, sizeof(rsp_buf), &rsp_len);
+        }
+    }
     if (ret != QSYSDB_OK) {
         db->last_error = ret;
         pthread_mutex_unlock(&db->lock);
@@ -296,6 +318,17 @@ int qsysdb_delete(qsysdb_t *db, const char *path)
     size_t rsp_len;
 
     ret = client_request(db, req, req_size, &rsp, sizeof(rsp), &rsp_len);
+    if (ret == QSYSDB_ERR_DISCONNECTED || ret == QSYSDB_ERR_IO) {
+        int reason = (ret == QSYSDB_ERR_IO) ? QSYSDB_DISCONNECT_IO
+                                              : QSYSDB_DISCONNECT_SERVER;
+        int rc = client_handle_disconnect(db, ret, reason);
+        if (rc == QSYSDB_ERR_AGAIN) {
+            /* Reconnected — rebuild request ID and retry */
+            qsysdb_msg_init(&req->hdr, QSYSDB_MSG_DELETE_REQ,
+                            (uint32_t)req_size, db->next_request_id++);
+            ret = client_request(db, req, req_size, &rsp, sizeof(rsp), &rsp_len);
+        }
+    }
     if (ret != QSYSDB_OK) {
         db->last_error = ret;
         pthread_mutex_unlock(&db->lock);
@@ -411,6 +444,17 @@ int qsysdb_list(qsysdb_t *db, const char *prefix, char ***paths, size_t *count)
 
     size_t rsp_len;
     int ret = client_request(db, req, req_size, rsp_buf, RECV_BUF_SIZE, &rsp_len);
+    if (ret == QSYSDB_ERR_DISCONNECTED || ret == QSYSDB_ERR_IO) {
+        int reason = (ret == QSYSDB_ERR_IO) ? QSYSDB_DISCONNECT_IO
+                                              : QSYSDB_DISCONNECT_SERVER;
+        int rc = client_handle_disconnect(db, ret, reason);
+        if (rc == QSYSDB_ERR_AGAIN) {
+            /* Reconnected — rebuild request ID and retry */
+            qsysdb_msg_init(&req->hdr, QSYSDB_MSG_LIST_REQ,
+                            (uint32_t)req_size, db->next_request_id++);
+            ret = client_request(db, req, req_size, rsp_buf, RECV_BUF_SIZE, &rsp_len);
+        }
+    }
     if (ret != QSYSDB_OK) {
         free(rsp_buf);
         pthread_mutex_unlock(&db->lock);
@@ -486,6 +530,17 @@ int qsysdb_delete_tree(qsysdb_t *db, const char *prefix, size_t *deleted)
     size_t rsp_len;
 
     int ret = client_request(db, req, req_size, &rsp, sizeof(rsp), &rsp_len);
+    if (ret == QSYSDB_ERR_DISCONNECTED || ret == QSYSDB_ERR_IO) {
+        int reason = (ret == QSYSDB_ERR_IO) ? QSYSDB_DISCONNECT_IO
+                                              : QSYSDB_DISCONNECT_SERVER;
+        int rc = client_handle_disconnect(db, ret, reason);
+        if (rc == QSYSDB_ERR_AGAIN) {
+            /* Reconnected — rebuild request ID and retry */
+            qsysdb_msg_init(&req->hdr, QSYSDB_MSG_DELETE_TREE_REQ,
+                            (uint32_t)req_size, db->next_request_id++);
+            ret = client_request(db, req, req_size, &rsp, sizeof(rsp), &rsp_len);
+        }
+    }
     if (ret != QSYSDB_OK) {
         pthread_mutex_unlock(&db->lock);
         return ret;
@@ -542,6 +597,17 @@ int qsysdb_subscribe(qsysdb_t *db, const char *pattern,
     size_t rsp_len;
 
     int ret = client_request(db, req, req_size, &rsp, sizeof(rsp), &rsp_len);
+    if (ret == QSYSDB_ERR_DISCONNECTED || ret == QSYSDB_ERR_IO) {
+        int reason = (ret == QSYSDB_ERR_IO) ? QSYSDB_DISCONNECT_IO
+                                              : QSYSDB_DISCONNECT_SERVER;
+        int rc = client_handle_disconnect(db, ret, reason);
+        if (rc == QSYSDB_ERR_AGAIN) {
+            /* Reconnected — rebuild request ID and retry */
+            qsysdb_msg_init(&req->hdr, QSYSDB_MSG_SUBSCRIBE_REQ,
+                            (uint32_t)req_size, db->next_request_id++);
+            ret = client_request(db, req, req_size, &rsp, sizeof(rsp), &rsp_len);
+        }
+    }
     if (ret != QSYSDB_OK) {
         pthread_mutex_unlock(&db->lock);
         return ret;
@@ -622,6 +688,16 @@ int qsysdb_poll(qsysdb_t *db, int timeout_ms)
 
     if (ret == 0) {
         return 0;  /* Timeout */
+    }
+
+    if (pfd.revents & (POLLHUP | POLLERR)) {
+        pthread_mutex_lock(&db->lock);
+        int rc = client_handle_disconnect(db, QSYSDB_ERR_DISCONNECTED,
+                                          QSYSDB_DISCONNECT_SERVER);
+        pthread_mutex_unlock(&db->lock);
+        if (rc == QSYSDB_ERR_AGAIN)
+            return 0;  /* Reconnected, will get data on next poll */
+        return QSYSDB_ERR_DISCONNECTED;
     }
 
     pthread_mutex_lock(&db->lock);
@@ -815,6 +891,17 @@ int qsysdb_stats(qsysdb_t *db, struct qsysdb_stats *stats)
         size_t rsp_len;
 
         int ret = client_request(db, &req, sizeof(req), &rsp, sizeof(rsp), &rsp_len);
+        if (ret == QSYSDB_ERR_DISCONNECTED || ret == QSYSDB_ERR_IO) {
+            int reason = (ret == QSYSDB_ERR_IO) ? QSYSDB_DISCONNECT_IO
+                                                  : QSYSDB_DISCONNECT_SERVER;
+            int rc = client_handle_disconnect(db, ret, reason);
+            if (rc == QSYSDB_ERR_AGAIN) {
+                /* Reconnected — rebuild request ID and retry */
+                qsysdb_msg_init(&req.hdr, QSYSDB_MSG_STATS_REQ,
+                                sizeof(req), db->next_request_id++);
+                ret = client_request(db, &req, sizeof(req), &rsp, sizeof(rsp), &rsp_len);
+            }
+        }
         if (ret != QSYSDB_OK) {
             pthread_mutex_unlock(&db->lock);
             return ret;
