@@ -32,6 +32,20 @@ typedef void (*qsysdb_callback_t)(const char *path, const char *value,
                                    int event_type, void *userdata);
 
 /*
+ * Disconnect reason codes
+ */
+#define QSYSDB_DISCONNECT_SERVER    1   /* Server closed connection */
+#define QSYSDB_DISCONNECT_IO        2   /* I/O error */
+#define QSYSDB_DISCONNECT_TIMEOUT   3   /* Connection timed out */
+#define QSYSDB_DISCONNECT_USER      4   /* User called disconnect */
+
+/*
+ * Connection lifecycle callback types
+ */
+typedef void (*qsysdb_connect_fn)(qsysdb_t *db, void *userdata);
+typedef void (*qsysdb_disconnect_fn)(qsysdb_t *db, int reason, void *userdata);
+
+/*
  * Connection Management
  */
 
@@ -93,6 +107,44 @@ const char *qsysdb_strerror(int error_code);
  * @return             true if connected, false otherwise
  */
 bool qsysdb_connected(qsysdb_t *db);
+
+/**
+ * Register callback for connection established
+ *
+ * Called after initial connect and after each successful reconnect.
+ *
+ * @param db        Connection handle
+ * @param callback  Connect callback (NULL to clear)
+ * @param userdata  User data passed to callback
+ */
+void qsysdb_on_connect(qsysdb_t *db, qsysdb_connect_fn callback, void *userdata);
+
+/**
+ * Register callback for connection lost
+ *
+ * Called when connection to server is lost. If auto-reconnect is enabled,
+ * this is called before reconnection attempts begin.
+ *
+ * @param db        Connection handle
+ * @param callback  Disconnect callback (NULL to clear)
+ * @param userdata  User data passed to callback
+ */
+void qsysdb_on_disconnect(qsysdb_t *db, qsysdb_disconnect_fn callback, void *userdata);
+
+/**
+ * Enable automatic reconnection
+ *
+ * When enabled, the client will automatically attempt to reconnect when
+ * a disconnection is detected during any operation or poll. After
+ * reconnecting, all active subscriptions are re-established.
+ *
+ * @param db              Connection handle
+ * @param auto_reconnect  Enable/disable auto-reconnect
+ * @param interval_ms     Base reconnect interval in milliseconds (doubles on each retry, max 30s)
+ * @param max_retries     Maximum reconnection attempts (0 = unlimited)
+ */
+void qsysdb_set_reconnect(qsysdb_t *db, bool auto_reconnect,
+                           int interval_ms, int max_retries);
 
 /*
  * Basic Operations
