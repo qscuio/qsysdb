@@ -118,7 +118,8 @@ TEST_CFLAGS := $(CFLAGS) -I$(CURDIR)/tests -Wno-unused-function
 tests-unit: dirs $(COMMON_OBJS) $(DAEMON_OBJS_NO_MAIN) $(LIB_OBJS) \
 	$(BINDIR)/test_json_unit $(BINDIR)/test_radix_unit $(BINDIR)/test_database_unit \
 	$(BINDIR)/test_multiclient $(BINDIR)/test_network_tables $(BINDIR)/test_async_client \
-	$(BINDIR)/test_cluster $(BINDIR)/test_election
+	$(BINDIR)/test_cluster $(BINDIR)/test_election \
+	$(BINDIR)/test_sync_reconnect
 
 $(BINDIR)/test_json_unit: $(TESTDIR)/unit/test_json_unit.c $(SRCDIR)/common/json.c
 	$(CC) $(TEST_CFLAGS) $^ -o $@ -lm
@@ -142,6 +143,9 @@ $(BINDIR)/test_cluster: $(TESTDIR)/unit/test_cluster.c $(COMMON_OBJS) $(DAEMON_O
 	$(CC) $(TEST_CFLAGS) $^ -o $@ $(LDFLAGS) -lm
 
 $(BINDIR)/test_election: $(TESTDIR)/unit/test_election.c $(COMMON_OBJS) $(DAEMON_OBJS_NO_MAIN)
+	$(CC) $(TEST_CFLAGS) $^ -o $@ $(LDFLAGS) -lm
+
+$(BINDIR)/test_sync_reconnect: $(TESTDIR)/unit/test_sync_reconnect.c $(COMMON_OBJS) $(LIB_OBJS)
 	$(CC) $(TEST_CFLAGS) $^ -o $@ $(LDFLAGS) -lm
 
 # Benchmark tests
@@ -171,6 +175,7 @@ test-unit: tests-unit
 	@$(BINDIR)/test_async_client
 	@$(BINDIR)/test_cluster
 	@$(BINDIR)/test_election
+	@$(BINDIR)/test_sync_reconnect
 
 # Run benchmarks
 .PHONY: benchmark
