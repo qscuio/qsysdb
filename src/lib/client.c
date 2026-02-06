@@ -31,7 +31,7 @@
  * Perform connection handshake with server
  * This is shared between Unix and TCP connections
  */
-static int client_handshake(struct qsysdb *db, int flags)
+int client_handshake(struct qsysdb *db, int flags)
 {
     struct qsysdb_msg_connect_req req = {0};
     qsysdb_msg_init(&req.hdr, QSYSDB_MSG_CONNECT_REQ,
@@ -145,6 +145,11 @@ qsysdb_t *qsysdb_connect(const char *socket_path, int flags)
         return NULL;
     }
 
+    /* Fire connect callback */
+    if (db->on_connect) {
+        db->on_connect(db, db->on_connect_data);
+    }
+
     return db;
 }
 
@@ -178,6 +183,11 @@ qsysdb_t *qsysdb_connect_tcp(const char *host, uint16_t port, int flags)
         db->last_error = ret;
         client_free(db);
         return NULL;
+    }
+
+    /* Fire connect callback */
+    if (db->on_connect) {
+        db->on_connect(db, db->on_connect_data);
     }
 
     return db;
@@ -230,6 +240,15 @@ void qsysdb_disconnect(qsysdb_t *db)
     }
 
     pthread_mutex_lock(&db->lock);
+
+    /* Fire disconnect callback for user-initiated disconnect */
+    if (db->on_disconnect) {
+        qsysdb_disconnect_fn cb = db->on_disconnect;
+        void *data = db->on_disconnect_data;
+        pthread_mutex_unlock(&db->lock);
+        cb(db, QSYSDB_DISCONNECT_USER, data);
+        pthread_mutex_lock(&db->lock);
+    }
 
     /* Abort any active transaction */
     if (db->active_txn) {
@@ -495,6 +514,163 @@ int client_process_notifications(struct qsysdb *db)
     }
 
     return processed;
+}
+
+/*
+ * Re-subscribe all active subscriptions after reconnect.
+ * Called with lock held.
+ */
+static int client_resubscribe_all(struct qsysdb *db)
+{
+    for (int i = 0; i < MAX_LOCAL_SUBS; i++) {
+        if (!db->subscriptions[i].active)
+            continue;
+
+        struct local_subscription *sub = &db->subscriptions[i];
+        size_t pattern_len = strlen(sub->pattern);
+        size_t req_size = sizeof(struct qsysdb_msg_subscribe_req) + pattern_len;
+        struct qsysdb_msg_subscribe_req *req = alloca(req_size);
+        memset(req, 0, sizeof(*req));
+
+        qsysdb_msg_init(&req->hdr, QSYSDB_MSG_SUBSCRIBE_REQ,
+                        (uint32_t)req_size, db->next_request_id++);
+        req->flags = 0;
+        req->pattern_len = (uint16_t)pattern_len;
+        memcpy(req->pattern, sub->pattern, pattern_len);
+
+        struct qsysdb_msg_subscribe_rsp rsp;
+        size_t rsp_len;
+
+        int ret = client_request(db, req, req_size, &rsp, sizeof(rsp), &rsp_len);
+        if (ret != QSYSDB_OK || rsp.hdr.error_code != QSYSDB_OK)
+            return ret != QSYSDB_OK ? ret : rsp.hdr.error_code;
+
+        /* Update server-assigned ID */
+        sub->id = rsp.subscription_id;
+    }
+    return QSYSDB_OK;
+}
+
+int client_try_reconnect(struct qsysdb *db)
+{
+    if (!db->auto_reconnect || db->reconnecting)
+        return QSYSDB_ERR_DISCONNECTED;
+
+    db->reconnecting = true;
+
+    int interval = db->reconnect_interval_ms;
+    int max_retries = db->reconnect_max_retries;
+    int ret = QSYSDB_ERR_CONNECT;
+
+    for (db->reconnect_attempt = 0;
+         max_retries == 0 || db->reconnect_attempt < max_retries;
+         db->reconnect_attempt++) {
+
+        /* Close old socket */
+        if (db->transport && db->sock_fd >= 0) {
+            db->transport->disconnect(db);
+            db->sock_fd = -1;
+        }
+
+        /* Sleep before retry (unlock so callbacks/other threads aren't blocked) */
+        if (db->reconnect_attempt > 0) {
+            pthread_mutex_unlock(&db->lock);
+            usleep((useconds_t)interval * 1000);
+            pthread_mutex_lock(&db->lock);
+
+            /* Exponential backoff, cap at 30 seconds */
+            interval *= 2;
+            if (interval > 30000)
+                interval = 30000;
+        }
+
+        /* Reconnect via transport */
+        ret = db->transport->connect(db);
+        if (ret != QSYSDB_OK)
+            continue;
+
+        /* Re-handshake */
+        ret = client_handshake(db, (int)db->flags);
+        if (ret != QSYSDB_OK)
+            continue;
+
+        /* Re-subscribe */
+        ret = client_resubscribe_all(db);
+        if (ret != QSYSDB_OK) {
+            db->transport->disconnect(db);
+            db->sock_fd = -1;
+            db->connected = false;
+            continue;
+        }
+
+        /* Success */
+        db->reconnect_attempt = 0;
+        db->reconnecting = false;
+
+        /* Fire connect callback (unlock for user code) */
+        if (db->on_connect) {
+            qsysdb_connect_fn cb = db->on_connect;
+            void *data = db->on_connect_data;
+            pthread_mutex_unlock(&db->lock);
+            cb(db, data);
+            pthread_mutex_lock(&db->lock);
+        }
+
+        return QSYSDB_OK;
+    }
+
+    db->reconnecting = false;
+    return QSYSDB_ERR_CONNECT;
+}
+
+int client_handle_disconnect(struct qsysdb *db, int error, int reason)
+{
+    if (error != QSYSDB_ERR_DISCONNECTED && error != QSYSDB_ERR_IO)
+        return error;
+
+    db->connected = false;
+
+    /* Fire disconnect callback (unlock for user code) */
+    if (db->on_disconnect) {
+        qsysdb_disconnect_fn cb = db->on_disconnect;
+        void *data = db->on_disconnect_data;
+        pthread_mutex_unlock(&db->lock);
+        cb(db, reason, data);
+        pthread_mutex_lock(&db->lock);
+    }
+
+    /* Attempt reconnect */
+    if (db->auto_reconnect) {
+        int ret = client_try_reconnect(db);
+        if (ret == QSYSDB_OK)
+            return QSYSDB_ERR_AGAIN;  /* Caller should retry the operation */
+    }
+
+    return error;
+}
+
+void qsysdb_on_connect(qsysdb_t *db, qsysdb_connect_fn callback, void *userdata)
+{
+    if (!db) return;
+    db->on_connect = callback;
+    db->on_connect_data = userdata;
+}
+
+void qsysdb_on_disconnect(qsysdb_t *db, qsysdb_disconnect_fn callback, void *userdata)
+{
+    if (!db) return;
+    db->on_disconnect = callback;
+    db->on_disconnect_data = userdata;
+}
+
+void qsysdb_set_reconnect(qsysdb_t *db, bool auto_reconnect,
+                           int interval_ms, int max_retries)
+{
+    if (!db) return;
+    db->auto_reconnect = auto_reconnect;
+    db->reconnect_interval_ms = interval_ms > 0 ? interval_ms : 1000;
+    db->reconnect_max_retries = max_retries;
+    db->reconnect_attempt = 0;
 }
 
 const char *qsysdb_version(void)
