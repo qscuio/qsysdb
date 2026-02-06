@@ -89,6 +89,19 @@ struct qsysdb {
 
     /* Thread safety */
     pthread_mutex_t lock;
+
+    /* Connection lifecycle callbacks */
+    qsysdb_connect_fn on_connect;
+    void *on_connect_data;
+    qsysdb_disconnect_fn on_disconnect;
+    void *on_disconnect_data;
+
+    /* Auto-reconnect configuration */
+    bool auto_reconnect;
+    int reconnect_interval_ms;      /* Base interval */
+    int reconnect_max_retries;      /* 0 = unlimited */
+    int reconnect_attempt;          /* Current attempt counter */
+    bool reconnecting;              /* Guard against recursive reconnect */
 };
 
 /*
@@ -114,5 +127,14 @@ int client_process_notifications(struct qsysdb *db);
 
 /* Find local subscription by server ID */
 struct local_subscription *client_find_subscription(struct qsysdb *db, int id);
+
+/* Perform connection handshake with server */
+int client_handshake(struct qsysdb *db, int flags);
+
+/* Attempt reconnection after disconnect (called with lock held) */
+int client_try_reconnect(struct qsysdb *db);
+
+/* Check for disconnect and attempt reconnect if enabled (called with lock held) */
+int client_handle_disconnect(struct qsysdb *db, int error, int reason);
 
 #endif /* QSYSDB_CLIENT_H */
