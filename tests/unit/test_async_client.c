@@ -681,6 +681,140 @@ TEST(sync_delete_without_connection)
 }
 
 /* ============================================
+ * Auto-Reconnect Tests
+ * ============================================ */
+
+TEST(reconnect_first_connect_failure_with_auto_reconnect)
+{
+    /* When auto_reconnect is enabled and first connect fails,
+     * it should return OK and start reconnect timer */
+    qsysdb_async_t *client = qsysdb_async_new();
+    TEST_ASSERT_NOT_NULL(client);
+
+    qsysdb_async_set_reconnect(client, true, 100);
+
+    int ret = qsysdb_async_connect(client, "/nonexistent/path.sock", 0);
+    TEST_ASSERT_EQ(QSYSDB_OK, ret);
+
+    /* Should not be connected yet */
+    TEST_ASSERT_FALSE(qsysdb_async_is_connected(client));
+
+    /* fd() should return a valid timerfd for event loop integration */
+    int fd = qsysdb_async_fd(client);
+    TEST_ASSERT_TRUE(fd >= 0);
+
+    /* events() should indicate read (timerfd) */
+    int events = qsysdb_async_events(client);
+    TEST_ASSERT_EQ(QSYSDB_WAIT_READ, events);
+
+    qsysdb_async_free(client);
+}
+
+TEST(reconnect_first_connect_failure_without_auto_reconnect)
+{
+    /* Without auto_reconnect, first connect failure returns error */
+    qsysdb_async_t *client = qsysdb_async_new();
+    TEST_ASSERT_NOT_NULL(client);
+
+    int ret = qsysdb_async_connect(client, "/nonexistent/path.sock", 0);
+    TEST_ASSERT_NE(QSYSDB_OK, ret);
+
+    /* fd should be -1 */
+    TEST_ASSERT_EQ(-1, qsysdb_async_fd(client));
+
+    qsysdb_async_free(client);
+}
+
+TEST(reconnect_tcp_first_connect_with_auto_reconnect)
+{
+    /* TCP first-connect failure with auto_reconnect should return OK */
+    qsysdb_async_t *client = qsysdb_async_new();
+    TEST_ASSERT_NOT_NULL(client);
+
+    qsysdb_async_set_reconnect(client, true, 100);
+
+    /* Connect to invalid address - note: TCP connect with EINPROGRESS
+     * may return OK even without auto_reconnect, so use an invalid IP */
+    int ret = qsysdb_async_connect_tcp(client, "192.0.2.1", 1, 0);
+    /* Should succeed (either connected in progress or reconnect scheduled) */
+    TEST_ASSERT_EQ(QSYSDB_OK, ret);
+
+    /* Should have a valid fd (either socket or timerfd) */
+    TEST_ASSERT_TRUE(qsysdb_async_fd(client) >= 0);
+
+    qsysdb_async_free(client);
+}
+
+TEST(reconnect_disconnect_cancels_timer)
+{
+    /* User-initiated disconnect should cancel reconnect timer */
+    qsysdb_async_t *client = qsysdb_async_new();
+    TEST_ASSERT_NOT_NULL(client);
+
+    qsysdb_async_set_reconnect(client, true, 100);
+
+    qsysdb_async_connect(client, "/nonexistent/path.sock", 0);
+    TEST_ASSERT_TRUE(qsysdb_async_fd(client) >= 0);
+
+    /* User disconnect should cancel reconnect */
+    qsysdb_async_disconnect(client);
+    TEST_ASSERT_EQ(-1, qsysdb_async_fd(client));
+
+    qsysdb_async_free(client);
+}
+
+TEST(reconnect_disable_stops_timer)
+{
+    /* Disabling auto_reconnect should stop active timer */
+    qsysdb_async_t *client = qsysdb_async_new();
+    TEST_ASSERT_NOT_NULL(client);
+
+    qsysdb_async_set_reconnect(client, true, 100);
+    qsysdb_async_connect(client, "/nonexistent/path.sock", 0);
+    TEST_ASSERT_TRUE(qsysdb_async_fd(client) >= 0);
+
+    /* Disable reconnect */
+    qsysdb_async_set_reconnect(client, false, 0);
+    TEST_ASSERT_EQ(-1, qsysdb_async_fd(client));
+
+    qsysdb_async_free(client);
+}
+
+TEST(reconnect_poll_returns_disconnected_without_reconnect)
+{
+    /* poll() should return DISCONNECTED when not connected and no reconnect */
+    qsysdb_async_t *client = qsysdb_async_new();
+    TEST_ASSERT_NOT_NULL(client);
+
+    int ret = qsysdb_async_poll(client, 0);
+    TEST_ASSERT_EQ(QSYSDB_ERR_DISCONNECTED, ret);
+
+    qsysdb_async_free(client);
+}
+
+TEST(reconnect_process_returns_again_during_reconnect)
+{
+    /* process() should attempt reconnect when timerfd fires */
+    qsysdb_async_t *client = qsysdb_async_new();
+    TEST_ASSERT_NOT_NULL(client);
+
+    qsysdb_async_set_reconnect(client, true, 10);  /* 10ms interval */
+    qsysdb_async_connect(client, "/nonexistent/path.sock", 0);
+
+    /* Wait for timer to fire */
+    usleep(50000);  /* 50ms */
+
+    /* process() should attempt reconnect (will fail, re-arm timer) */
+    int ret = qsysdb_async_process(client);
+    TEST_ASSERT_EQ(QSYSDB_ERR_AGAIN, ret);
+
+    /* Should still have a valid fd (re-armed timerfd) */
+    TEST_ASSERT_TRUE(qsysdb_async_fd(client) >= 0);
+
+    qsysdb_async_free(client);
+}
+
+/* ============================================
  * Test Main
  * ============================================ */
 
